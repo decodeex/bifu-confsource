@@ -166,10 +166,12 @@ func (e *testEnv) gauge(name string) float64 {
 	return 0
 }
 
-// assertCommitted 验收口径：revision、磁盘快照、gauge 三者都指向同一版，且不在降级态
+// assertCommitted 验收口径：revision、磁盘快照、gauge 三者都指向同一版，且不在降级态。
+// 提交顺序是 Store → 写快照 → committed，测试通常先等到 GetConfig() 变化，此时 committed 可能还差几微秒，
+// 所以先等 Revision() 到位再逐项断言；已经到位时立即通过
 func (e *testEnv) assertCommitted(src *confsource.Source, rev int64, yaml string) {
 	e.t.Helper()
-	require.Equal(e.t, rev, src.Revision(), "Revision()")
+	require.Eventually(e.t, func() bool { return src.Revision() == rev }, 5*time.Second, 10*time.Millisecond, "Revision() should reach %d, got %d", rev, src.Revision())
 	require.Equal(e.t, yaml, e.snapshot(), "disk snapshot")
 	require.Equal(e.t, float64(rev), e.gauge("confsource_loaded_revision"), "loaded_revision gauge")
 	require.False(e.t, src.Degraded(), "Degraded()")
@@ -235,4 +237,19 @@ func overwriteSnapshot(t *testing.T, env *testEnv, yaml string) {
 	t.Helper()
 	path := filepath.Join(env.snapshots, "develop", testService+".yaml")
 	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+}
+
+// breakSnapshotDir 把快照目录换成一个普通文件，让后续写盘以 ENOTDIR 失败；旧快照挪到旁边保留
+func (e *testEnv) breakSnapshotDir() {
+	e.t.Helper()
+	dir := filepath.Join(e.snapshots, "develop")
+	require.NoError(e.t, os.Rename(dir, dir+".bak"))
+	require.NoError(e.t, os.WriteFile(dir, []byte("not a directory"), 0o644))
+}
+
+func (e *testEnv) restoreSnapshotDir() {
+	e.t.Helper()
+	dir := filepath.Join(e.snapshots, "develop")
+	require.NoError(e.t, os.Remove(dir))
+	require.NoError(e.t, os.Rename(dir+".bak", dir))
 }

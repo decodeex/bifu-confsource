@@ -109,6 +109,9 @@ func (s *Source) Load() ([]*config.KeyValue, error) {
 			return nil, fmt.Errorf("confsource: snapshot rejected: %w", verr)
 		}
 	}
+	if cerr := s.runOnCommit(snapRev, snapRaw); cerr != nil {
+		return nil, fmt.Errorf("confsource: snapshot apply failed: %w", cerr)
+	}
 	s.committed.Store(snapRev)
 	s.metrics.loadedRevision.Set(float64(snapRev))
 	s.setDegraded(true)
@@ -177,13 +180,17 @@ func publishIDFrom(r *pb.RangeResponse) string {
 	return meta.PublishID
 }
 
-// commit 校验通过后写快照并推进 revision。校验失败时什么都不动；
-// 快照写失败只记日志，etcd 才是主路径，不能因为节点磁盘问题拒绝一份合法配置。
+// commit 按固定顺序提交一个版本：Validator → OnCommit（加载器 Store）→ 写快照 → 推进 revision 与指标。
+// 校验或加载失败时什么都不动，内存、快照、指标一起停在上一版；
+// 快照写失败只记日志，etcd 才是主路径，不能因为节点磁盘问题拒绝一份已经加载成功的配置。
 func (s *Source) commit(rev int64, raw []byte, publishID string) error {
 	if s.opts.validator != nil {
 		if err := s.opts.validator(rev, raw); err != nil {
 			return fmt.Errorf("confsource: revision %d rejected: %w", rev, err)
 		}
+	}
+	if err := s.runOnCommit(rev, raw); err != nil {
+		return fmt.Errorf("confsource: revision %d apply failed: %w", rev, err)
 	}
 	if err := s.snap.write(raw, snapshotMeta{ModRevision: rev, PublishID: publishID, SavedAt: time.Now()}); err != nil {
 		s.log.Errorf("write snapshot failed: %v", err)
@@ -191,6 +198,19 @@ func (s *Source) commit(rev int64, raw []byte, publishID string) error {
 	s.committed.Store(rev)
 	s.metrics.loadedRevision.Set(float64(rev))
 	return nil
+}
+
+// runOnCommit 调用提交回调，panic 一律按返回错误处理，事件循环不能因为加载器的 bug 停掉
+func (s *Source) runOnCommit(rev int64, raw []byte) (err error) {
+	if s.opts.onCommit == nil {
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("on-commit panic: %v", r)
+		}
+	}()
+	return s.opts.onCommit(rev, raw)
 }
 
 func (s *Source) keyValues(raw []byte) []*config.KeyValue {

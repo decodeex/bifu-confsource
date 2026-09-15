@@ -2,6 +2,8 @@ package confsource_test
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,4 +204,114 @@ func TestSource_RequiresEndpointsEnvService(t *testing.T) {
 	require.ErrorContains(t, err, "service required")
 	_, err = confsource.New(confsource.WithEndpoints("http://127.0.0.1:1"), confsource.WithEnv("qa"), confsource.WithService("x"))
 	require.ErrorContains(t, err, `unknown env "qa"`)
+}
+
+// OnCommit 返回 error：快照、gauge、revision 都停在上一版，后续合法版本照常
+func TestSource_OnCommitErrorKeepsPreviousEverywhere(t *testing.T) {
+	env := newTestEnv(t)
+	revA := env.publish(yamlA, "pub-a")
+
+	src, err := confsource.New(env.options(confsource.WithOnCommit(func(_ int64, raw []byte) error {
+		if string(raw) == yamlB {
+			return errors.New("injected apply failure before store")
+		}
+		return nil
+	}))...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	env.assertCommitted(src, revA, yamlA)
+
+	revB := env.publish(yamlB, "pub-b")
+	require.Eventually(t, func() bool {
+		return strings.Contains(env.logs.String(), fmt.Sprintf("revision %d apply failed", revB))
+	}, 5*time.Second, 20*time.Millisecond)
+	env.assertCommitted(src, revA, yamlA)
+
+	revC := env.publish(yamlC, "pub-c")
+	kvs := nextWithin(t, w, 10*time.Second)
+	require.Equal(t, yamlC, string(kvs[0].Value))
+	env.assertCommitted(src, revC, yamlC)
+}
+
+// OnCommit panic 按返回 error 处理，事件循环不中断
+func TestSource_OnCommitPanicIsTreatedAsFailure(t *testing.T) {
+	env := newTestEnv(t)
+	revA := env.publish(yamlA, "pub-a")
+
+	src, err := confsource.New(env.options(confsource.WithOnCommit(func(_ int64, raw []byte) error {
+		if string(raw) == yamlB {
+			panic("injected panic before store")
+		}
+		return nil
+	}))...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+
+	revB := env.publish(yamlB, "pub-b")
+	require.Eventually(t, func() bool {
+		return strings.Contains(env.logs.String(), fmt.Sprintf("revision %d apply failed: on-commit panic", revB))
+	}, 5*time.Second, 20*time.Millisecond)
+	env.assertCommitted(src, revA, yamlA)
+
+	revC := env.publish(yamlC, "pub-c")
+	kvs := nextWithin(t, w, 10*time.Second)
+	require.Equal(t, yamlC, string(kvs[0].Value))
+	env.assertCommitted(src, revC, yamlC)
+}
+
+// 首次 Load 时 OnCommit 失败：Load 返回错误，不落快照，服务不得启动
+func TestSource_OnCommitFailureFailsLoad(t *testing.T) {
+	env := newTestEnv(t)
+	env.publish(yamlA, "pub-a")
+
+	src, err := confsource.New(env.options(confsource.WithOnCommit(func(int64, []byte) error {
+		return errors.New("cannot apply")
+	}))...)
+	require.NoError(t, err)
+	defer src.Close()
+
+	_, err = src.Load()
+	require.ErrorContains(t, err, "apply failed")
+	require.Empty(t, env.snapshot())
+	require.Zero(t, src.Revision())
+}
+
+// 同节点另一副本已把快照写到新版本，本实例提交同一版本时跳过写盘，但 OnCommit 仍要执行、revision 仍要推进
+func TestSource_OnCommitRunsEvenWhenSnapshotAlreadyAhead(t *testing.T) {
+	env := newTestEnv(t)
+	revA := env.publish(yamlA, "pub-a")
+
+	var committedRevs []int64
+	src, err := confsource.New(env.options(confsource.WithOnCommit(func(rev int64, _ []byte) error {
+		committedRevs = append(committedRevs, rev)
+		return nil
+	}))...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	require.Equal(t, []int64{revA}, committedRevs)
+
+	revB := env.publish(yamlB, "pub-b")
+	replica, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	_, err = replica.Load()
+	require.NoError(t, err)
+	require.NoError(t, replica.Close())
+	require.Equal(t, yamlB, env.snapshot(), "the other replica wrote the snapshot first")
+
+	w, err := src.Watch()
+	require.NoError(t, err)
+	kvs := nextWithin(t, w, 10*time.Second)
+	require.Equal(t, yamlB, string(kvs[0].Value))
+	require.Equal(t, []int64{revA, revB}, committedRevs, "OnCommit must run even though the disk already had B")
+	env.assertCommitted(src, revB, yamlB)
 }
