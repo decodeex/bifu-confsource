@@ -61,7 +61,6 @@ func (e *testEnv) endpoint() string {
 func (e *testEnv) options(extra ...confsource.Option) []confsource.Option {
 	opts := []confsource.Option{
 		confsource.WithEndpoints(e.endpoint()),
-		confsource.WithEnv("dev"),
 		confsource.WithService(testService),
 		confsource.WithSnapshotDir(e.snapshots),
 		confsource.WithRegisterer(e.registry),
@@ -122,8 +121,8 @@ func (e *testEnv) publish(yaml, publishID string) int64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	resp, err := e.cli.Txn(ctx).Then(
-		clientv3.OpPut("/config/develop/"+testService+".yaml", yaml),
-		clientv3.OpPut("/meta/develop/"+testService, fmt.Sprintf(`{"publish_id":%q}`, publishID)),
+		clientv3.OpPut("/config/"+testService+".yaml", yaml),
+		clientv3.OpPut("/meta/"+testService, fmt.Sprintf(`{"publish_id":%q}`, publishID)),
 	).Commit()
 	require.NoError(e.t, err)
 	return resp.Header.Revision
@@ -133,7 +132,7 @@ func (e *testEnv) deleteConfig() {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err := e.cli.Delete(ctx, "/config/develop/"+testService+".yaml")
+	_, err := e.cli.Delete(ctx, "/config/"+testService+".yaml")
 	require.NoError(e.t, err)
 }
 
@@ -146,7 +145,7 @@ func (e *testEnv) compact(rev int64) {
 }
 
 func (e *testEnv) snapshot() string {
-	data, err := os.ReadFile(filepath.Join(e.snapshots, "develop", testService+".yaml"))
+	data, err := os.ReadFile(filepath.Join(e.snapshots, testService+".yaml"))
 	if err != nil {
 		return ""
 	}
@@ -235,21 +234,21 @@ func (b *logBuffer) String() string {
 // overwriteSnapshot 直接改写快照 yaml 而不动 meta，制造两者不配对的场景
 func overwriteSnapshot(t *testing.T, env *testEnv, yaml string) {
 	t.Helper()
-	path := filepath.Join(env.snapshots, "develop", testService+".yaml")
+	path := filepath.Join(env.snapshots, testService+".yaml")
 	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
 }
 
 // breakSnapshotDir 把快照目录换成一个普通文件，让后续写盘以 ENOTDIR 失败；旧快照挪到旁边保留
 func (e *testEnv) breakSnapshotDir() {
 	e.t.Helper()
-	dir := filepath.Join(e.snapshots, "develop")
+	dir := e.snapshots
 	require.NoError(e.t, os.Rename(dir, dir+".bak"))
 	require.NoError(e.t, os.WriteFile(dir, []byte("not a directory"), 0o644))
 }
 
 func (e *testEnv) restoreSnapshotDir() {
 	e.t.Helper()
-	dir := filepath.Join(e.snapshots, "develop")
+	dir := e.snapshots
 	require.NoError(e.t, os.Remove(dir))
 	require.NoError(e.t, os.Rename(dir+".bak", dir))
 }

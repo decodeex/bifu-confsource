@@ -6,14 +6,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-var metricLabels = []string{"env", "service"}
+var metricLabels = []string{"service"}
 
 type metrics struct {
 	loadedRevision prometheus.Gauge
 	degraded       prometheus.Gauge
 }
 
-func newMetrics(reg prometheus.Registerer, env PlatformEnv, service string) (*metrics, error) {
+func newMetrics(reg prometheus.Registerer, service string) (*metrics, error) {
 	loaded, err := registerGaugeVec(reg, prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "confsource_loaded_revision",
 		Help: "etcd ModRevision of the config currently committed by confsource",
@@ -29,8 +29,8 @@ func newMetrics(reg prometheus.Registerer, env PlatformEnv, service string) (*me
 		return nil, err
 	}
 	return &metrics{
-		loadedRevision: loaded.WithLabelValues(string(env), service),
-		degraded:       degraded.WithLabelValues(string(env), service),
+		loadedRevision: loaded.WithLabelValues(service),
+		degraded:       degraded.WithLabelValues(service),
 	}, nil
 }
 

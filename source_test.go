@@ -197,13 +197,11 @@ func TestSource_WatchOnlyOnce(t *testing.T) {
 	require.ErrorIs(t, err, confsource.ErrWatchStarted)
 }
 
-func TestSource_RequiresEndpointsEnvService(t *testing.T) {
-	_, err := confsource.New(confsource.WithEnv("dev"), confsource.WithService("x"))
+func TestSource_RequiresEndpointsAndService(t *testing.T) {
+	_, err := confsource.New(confsource.WithService("x"))
 	require.ErrorContains(t, err, "endpoints required")
-	_, err = confsource.New(confsource.WithEndpoints("http://127.0.0.1:1"), confsource.WithEnv("dev"))
+	_, err = confsource.New(confsource.WithEndpoints("http://127.0.0.1:1"))
 	require.ErrorContains(t, err, "service required")
-	_, err = confsource.New(confsource.WithEndpoints("http://127.0.0.1:1"), confsource.WithEnv("qa"), confsource.WithService("x"))
-	require.ErrorContains(t, err, `unknown env "qa"`)
 }
 
 // OnCommit 返回 error：快照、gauge、revision 都停在上一版，后续合法版本照常

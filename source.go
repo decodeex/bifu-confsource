@@ -19,9 +19,9 @@ const configFormat = "yaml"
 
 // Source 基于 etcd 的 Kratos 配置源：精确 key 读取与 Watch、本地快照、降级启动、串行提交。
 // 它不解析配置内容，${VAR} 展开与结构校验由调用方通过 Validator 注入。
+// 一套 etcd 只有一个环境的数据，key 只按服务名拼，服务连哪套 etcd 由部署决定。
 type Source struct {
 	opts      options
-	env       PlatformEnv
 	configKey string
 	metaKey   string
 	client    *clientv3.Client
@@ -38,7 +38,7 @@ type Source struct {
 	watchOnce sync.Once
 }
 
-// New 创建配置源，endpoints、env、service 缺一不可
+// New 创建配置源，endpoints 与 service 缺一不可
 func New(opts ...Option) (*Source, error) {
 	o := defaultOptions()
 	for _, opt := range opts {
@@ -50,10 +50,6 @@ func New(opts ...Option) (*Source, error) {
 	if o.service == "" {
 		return nil, errors.New("confsource: service required")
 	}
-	env, err := ParsePlatformEnv(o.podEnv)
-	if err != nil {
-		return nil, err
-	}
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   o.endpoints,
 		DialTimeout: o.timeout,
@@ -64,7 +60,7 @@ func New(opts ...Option) (*Source, error) {
 	if err != nil {
 		return nil, fmt.Errorf("confsource: etcd client: %w", err)
 	}
-	m, err := newMetrics(o.registerer, env, o.service)
+	m, err := newMetrics(o.registerer, o.service)
 	if err != nil {
 		client.Close()
 		return nil, err
@@ -72,13 +68,12 @@ func New(opts ...Option) (*Source, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Source{
 		opts:      o,
-		env:       env,
-		configKey: fmt.Sprintf("/config/%s/%s.yaml", env, o.service),
-		metaKey:   fmt.Sprintf("/meta/%s/%s", env, o.service),
+		configKey: fmt.Sprintf("/config/%s.yaml", o.service),
+		metaKey:   fmt.Sprintf("/meta/%s", o.service),
 		client:    client,
-		snap:      newSnapshotStore(o.snapshotDir, env, o.service),
+		snap:      newSnapshotStore(o.snapshotDir, o.service),
 		metrics:   m,
-		log:       log.NewHelper(log.With(o.logger, "module", "confsource", "env", string(env), "service", o.service)),
+		log:       log.NewHelper(log.With(o.logger, "module", "confsource", "service", o.service)),
 		ctx:       ctx,
 		cancel:    cancel,
 	}, nil

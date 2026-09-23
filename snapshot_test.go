@@ -8,7 +8,7 @@ import (
 )
 
 func TestSnapshotNeverGoesBackwards(t *testing.T) {
-	s := newSnapshotStore(t.TempDir(), EnvDevelop, "svc")
+	s := newSnapshotStore(t.TempDir(), "svc")
 
 	require.NoError(t, s.write([]byte("v5"), snapshotMeta{ModRevision: 5, PublishID: "p5"}))
 	require.NoError(t, s.write([]byte("v3"), snapshotMeta{ModRevision: 3, PublishID: "p3"}))
@@ -25,7 +25,7 @@ func TestSnapshotNeverGoesBackwards(t *testing.T) {
 }
 
 func TestSnapshotUnpairedMetaReadsAsRevisionZero(t *testing.T) {
-	s := newSnapshotStore(t.TempDir(), EnvDevelop, "svc")
+	s := newSnapshotStore(t.TempDir(), "svc")
 	require.NoError(t, s.write([]byte("v5"), snapshotMeta{ModRevision: 5}))
 	require.NoError(t, os.WriteFile(s.yamlPath, []byte("tampered"), 0o644))
 
@@ -36,17 +36,17 @@ func TestSnapshotUnpairedMetaReadsAsRevisionZero(t *testing.T) {
 }
 
 func TestSnapshotMissing(t *testing.T) {
-	s := newSnapshotStore(t.TempDir(), EnvDevelop, "svc")
+	s := newSnapshotStore(t.TempDir(), "svc")
 	_, _, err := s.read()
 	require.ErrorIs(t, err, ErrSnapshotMissing)
 }
 
 func TestSnapshotLeavesNoTempFiles(t *testing.T) {
 	dir := t.TempDir()
-	s := newSnapshotStore(dir, EnvDevelop, "svc")
+	s := newSnapshotStore(dir, "svc")
 	require.NoError(t, s.write([]byte("v1"), snapshotMeta{ModRevision: 1}))
 
-	entries, err := os.ReadDir(dir + "/develop")
+	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	var names []string
 	for _, e := range entries {

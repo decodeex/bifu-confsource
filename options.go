@@ -23,7 +23,6 @@ type Option func(*options)
 
 type options struct {
 	endpoints   []string
-	podEnv      string
 	service     string
 	snapshotDir string
 	timeout     time.Duration
@@ -66,11 +65,6 @@ func WithEndpoints(csv string) Option {
 			}
 		}
 	}
-}
-
-// WithEnv Pod 的 Env 取值（dev / release / staging / prod），内部映射到平台环境
-func WithEnv(podEnv string) Option {
-	return func(o *options) { o.podEnv = podEnv }
 }
 
 // WithService 服务名，与 bifufx-configmaps 中的文件名一致

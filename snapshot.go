@@ -27,8 +27,9 @@ type snapshotStore struct {
 	lockPath string
 }
 
-func newSnapshotStore(dir string, env PlatformEnv, service string) *snapshotStore {
-	base := filepath.Join(dir, string(env), service)
+// 一个节点只属于一个环境的集群，路径不需要环境段
+func newSnapshotStore(dir string, service string) *snapshotStore {
+	base := filepath.Join(dir, service)
 	return &snapshotStore{
 		yamlPath: base + ".yaml",
 		metaPath: base + ".yaml.meta",
