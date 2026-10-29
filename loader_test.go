@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 
 	"github.com/go-kratos/kratos/v2/config"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/decodeex/bifu-confsource"
 	"github.com/decodeex/bifu-confsource/envexpand"
@@ -82,7 +84,8 @@ func validate[T any](_ int64, raw []byte) error {
 	return err
 }
 
-// decodeStrict yaml → 严格展开 → json → T，与 Kratos Scan 的类型转换路径一致
+// decodeStrict yaml → 严格展开 → json → T，与 Kratos Scan 的类型转换路径一致：
+// T 是 protobuf 消息时走 protojson，否则 "0.2s" 这种 Duration、Timestamp 字段 encoding/json 解不进去
 func decodeStrict[T any](raw []byte) (*T, error) {
 	m, err := decode(raw)
 	if err != nil {
@@ -93,6 +96,12 @@ func decodeStrict[T any](raw []byte) (*T, error) {
 		return nil, err
 	}
 	cfg := new(T)
+	if msg, ok := any(cfg).(proto.Message); ok {
+		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(data, msg); err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	}
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
