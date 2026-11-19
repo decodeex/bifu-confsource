@@ -19,7 +19,7 @@
 ## 你要出手的点
 
 1. **公共 API 或协议要改时拍板**：AI 会先列受影响点，不自己改签名。
-2. **Git 与发布**：AI 只改文件；commit、push 由你做；推上去之后 AI 用本地路径替换解析伪版本并改 bifufx-api 的 `go.mod`，不 `go mod tidy`。
+2. **Git 与发布**：AI 只改文件；commit、push 由你做。本地验证用 `go.work` 或临时 `replace`，不用先提交，也不会进提交；推上去之后 AI 再用本地路径解析伪版本并改 bifufx-api 的 `go.mod`，不 `go mod tidy`。
 3. **bifufx-api 的配合改动**：加载器 `utils/configuration/etcd.go` 要不要改，AI 会在报告里明说。
 4. **CI**：bifufx-api 拉本仓靠 `.github/gitconfig` 的 SSH 改写，CI 身份对本仓的读权限由你与 SRE 确认。
 
