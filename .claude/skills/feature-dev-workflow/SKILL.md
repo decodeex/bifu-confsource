@@ -67,7 +67,7 @@ description: bifu-confsource（统一配置平台的 Kratos config.Source 客户
 - Watch 游标只跟 etcd 事件流走。**某一版校验失败时，游标照常推进、Committed Revision 不动**，这样坏版本不会被反复重投，下一版到来时正常处理；全量 resync 之后游标重新以 resync 读到的 header revision 为准。
 - Committed Revision 只升不降；revision 倒退（灾备恢复后 etcd 的 revision 比内存小）只能通过全量 resync 发现，按 ModRevision 单调规则处理，**不采用内容、不猜测**。
 - 快照单调性只对**写入它的那个实例**成立：写入的一定是该实例已 Store 成功的版本，不会高于它自己的 Committed Revision。同节点另一副本可能还停在上一版，它的 Committed Revision 可以低于磁盘上的 Snapshot Revision，这是正常的；它收到同一事件后照常校验、Store，写盘时按单调检查跳过。不要写「快照不高于内存」这种跨实例的断言。
-- **快照完整性校验不得削弱**：yaml 缺失或读不到 → `ErrSnapshotMissing`，Load 时转成 `ErrNoConfig` 拒绝启动；meta 缺失、损坏或与内容 hash 不配对 → 按系分现行规则，内容只能作为「未与 etcd 核对的降级内容」使用，revision 一律视为 0，**不得拿 meta 里的 revision 续订 Watch、不得据此置 degraded=0**，重连后必须全量 Get。任何版本都不能用「兼容旧格式」为理由跳过 hash 校验。
+- **快照完整性校验不得削弱**：快照只有在 yaml 可读、meta 可解析、且 meta 的 `content_hash` 与 yaml 现算哈希一致时才算存在；yaml 缺失、meta 缺失、meta 损坏、hash 不配对任一种都**视为无快照**，Load 时与「快照不存在」同路径返回 `ErrNoConfig`，不得把未通过校验的内容交给 Validator / OnCommit，也不得以 revision 0 的名义继续使用。日志里要能区分出是哪一种损坏。任何版本都不能用「兼容旧格式」为理由跳过 hash 校验。
 - compaction（`ErrCompacted` / `CompactRevision != 0`）一律全量 resync 后重建 Watch 起点；断连、compaction、resync 失败都走退避，不空转。
 
 **degraded 的语义只有一条**：内存里的配置来自本地快照、尚未与 etcd 核对过。它与「etcd 连接是否健康」「快照是否写成功」无关：
@@ -82,9 +82,9 @@ description: bifu-confsource（统一配置平台的 Kratos config.Source 客户
 **同一 Txn 读两个 key**：config 与 meta 必须来自同一 revision；`publish_id` 拿不到只影响快照 meta，不影响加载。`${VAR}` 缺失拒掉整版（严格模式默认）；Delete 事件忽略并告警；`ModRevision` 不大于 Committed Revision 的事件跳过。
 
 **并发安全与资源生命周期**
-- **首次 Load**：在调用方 goroutine 执行，只调用一次且在 `Watch()` 之前（Kratos 的顺序）；它的 commit 与快照写入和事件循环不并发；用 `Source.ctx` 加超时发 etcd 请求，`Close()` 后不得再 Load。
-- **Watch 阶段**：一个 `Source` 只有一条事件 goroutine，由 `Watch()` 启动且只允许一次（`ErrWatchStarted`）；启动后所有 commit 只发生在这条 goroutine 里；所有 goroutine 与 etcd 调用都派生自 `Source.ctx`，`Close()` 取消它并关闭 client，之后不得再有后台活动或往 channel 写。
-- 事件按 revision 顺序串行处理：Validator、OnCommit、快照写入都只在事件 goroutine 里调用，**不并发调用回调**；不加缓冲 channel、不丢事件、不乱序。
+- **回调在任何时刻最多只有一个在执行**：首次 `Load` 在调用方 goroutine 里做一次 commit（Validator → OnCommit → 快照）；`Watch()` 启动事件 goroutine 之后，所有 commit 只发生在这条 goroutine 里。两者靠调用顺序隔离：`Load` 只调用一次且先于 `Watch()`（Kratos 的顺序），`Watch()` 只允许启动一次（`ErrWatchStarted`），因此不存在两个 commit 并发，不需要也不要为回调再加锁。
+- **首次 Load**：用 `Source.ctx` 加超时发 etcd 请求，`Close()` 后不得再 Load。
+- **Watch 阶段**：事件按 revision 顺序串行处理，不加缓冲 channel、不丢事件、不乱序；所有 goroutine 与 etcd 调用都派生自 `Source.ctx`，`Close()` 取消它并关闭 client，之后不得再有后台活动或往 channel 写。
 - 慢消费者：交付给 Kratos 是阻塞的，前一版被取走之前不处理下一版；这是设计，不要为了「不阻塞」改成丢弃或覆盖。阻塞必须能被 ctx 取消打断，`Close()` 不能被慢消费者卡住。
 - 跨 goroutine 读写的状态（Committed Revision、degraded）只走原子操作；新增共享状态同样用原子或锁，并在 race 下验证。
 - 快照文件同节点多副本共享，写入必须在 flock 下且原子（临时文件 fsync + rename）。
@@ -135,11 +135,14 @@ go test -race -run 'TestXxx' -v ./...
 
 **本地验证**（不需要 commit / push，不访问远程）：先记下 bifufx-api 的 `git status`，再用 `go.work`（`go work use <bifufx-api> <本仓本地路径>`）或在它的 `go.mod` 临时加 `replace github.com/decodeex/bifu-confsource => <本仓本地路径>`，然后 `go build ./... && go test ./utils/configuration/...`。`go.work`、`go.work.sum` 与临时 `replace` **只用于本机验证，不得进入提交**；验证完只删掉自己加的这几处，再对照之前的 `git status`，用户原有的未提交改动一个都不能动，不用 `git checkout --`、`git stash`、`git clean` 之类的整体回退。
 
-**Go 命令不访问远程**：两条路径都在 `GOPROXY=off GOPRIVATE=github.com/decodeex/*` 下跑，依赖只许来自本机模块缓存与本地路径；命令因缺模块失败就停下来告诉用户，不自行改成联网下载，也不自行 `go mod download`。
+**Go 命令不访问远程**：`GOPROXY=off` 单独不够，GOPRIVATE / GONOPROXY 匹配的模块会绕过代理直接走 git 拉取，所以两条路径的环境要分开设，并且全部以命令行前缀传入，**不 `go env -w`、不改 `~/.gitconfig`、不改用户的 shell 环境**：
+- 本地离线验证（go.work / replace）：`GOFLAGS=-mod=mod GOPROXY=off GONOPROXY= GOPRIVATE= GOSUMDB=off GOVCS='*:off' GOTOOLCHAIN=local`。模块只许来自本机模块缓存与本地路径，VCS 一律关闭，不下载工具链。
+- 正式伪版本解析：只给本仓开 git，其余仍然关死：`GOPROXY=off GONOPROXY=github.com/decodeex/bifu-confsource GONOSUMDB=github.com/decodeex/bifu-confsource GOSUMDB=off GOVCS='github.com/decodeex/bifu-confsource:git,*:off' GOTOOLCHAIN=local`，再配合 `GIT_CONFIG_GLOBAL` 指向 scratchpad 里那份带 `insteadOf` 的 gitconfig，git 的「直接拉取」实际落在本地克隆。
+- 任一命令因缺模块、缺校验和、要换工具链而失败，停下来告诉用户，不自行改成联网下载，也不自行 `go mod download`。
 
 **正式升级**（伪版本钉死某个 commit）：
 1. 本仓改完、测试绿，**由用户 commit 并 push**（AI 不做）。
-2. 解析伪版本不经网络：在 scratchpad 放一份 gitconfig，用 `[url "<本仓本地路径>"] insteadOf = https://github.com/decodeex/bifu-confsource` 把模块地址指到本地克隆，然后 `GIT_CONFIG_GLOBAL=<那份文件> GOPROXY=off GOPRIVATE='github.com/decodeex/*' GOFLAGS=-mod=mod go get github.com/decodeex/bifu-confsource@<commit>` 得到 `v0.0.0-<时间戳>-<12位hash>` 与 go.sum。
+2. 解析伪版本不经网络：在 scratchpad 放一份 gitconfig，用 `[url "<本仓本地路径>"] insteadOf = https://github.com/decodeex/bifu-confsource` 把模块地址指到本地克隆，然后在上文「正式伪版本解析」的环境前缀下执行 `GIT_CONFIG_GLOBAL=<那份文件> GOFLAGS=-mod=mod go get github.com/decodeex/bifu-confsource@<commit>`，得到 `v0.0.0-<时间戳>-<12位hash>` 与 go.sum。
 3. 改 bifufx-api `go.mod` 的 require 行（放在直接依赖块，不带 `// indirect`），**不要 `go mod tidy`**（它会动无关依赖），然后 `go build ./... && go test ./utils/configuration/...`。
 4. 告诉用户：bifufx-api 这次只改 `go.mod` / `go.sum`；CI 拉本仓依赖 `.github/gitconfig` 的 SSH 改写与 CI 身份对本仓的读权限。
 
