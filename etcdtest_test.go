@@ -205,6 +205,69 @@ func (e *testEnv) snapshot() string {
 	return string(data)
 }
 
+// metric 按标签取一条序列的值；没有这条序列返回 ok=false。gauge 取 gauge 值，counter 取计数，histogram 取样本数
+func (e *testEnv) metric(name string, labels map[string]string) (value float64, ok bool) {
+	e.t.Helper()
+	families, err := e.registry.Gather()
+	require.NoError(e.t, err)
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+	next:
+		for _, m := range f.GetMetric() {
+			for k, v := range labels {
+				found := false
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == k && lp.GetValue() == v {
+						found = true
+					}
+				}
+				if !found {
+					continue next
+				}
+			}
+			switch {
+			case m.GetGauge() != nil:
+				return m.GetGauge().GetValue(), true
+			case m.GetCounter() != nil:
+				return m.GetCounter().GetValue(), true
+			case m.GetHistogram() != nil:
+				return float64(m.GetHistogram().GetSampleCount()), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// counter 读一个 counter 序列，不存在视为 0
+func (e *testEnv) counter(name string, labels map[string]string) float64 {
+	e.t.Helper()
+	v, _ := e.metric(name, labels)
+	return v
+}
+
+// labelValues 列出某指标在某标签上的全部取值，用来核对旧序列是否被清理
+func (e *testEnv) labelValues(name, label string) []string {
+	e.t.Helper()
+	families, err := e.registry.Gather()
+	require.NoError(e.t, err)
+	var out []string
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == label {
+					out = append(out, lp.GetValue())
+				}
+			}
+		}
+	}
+	return out
+}
+
 func (e *testEnv) gauge(name string) float64 {
 	e.t.Helper()
 	families, err := e.registry.Gather()

@@ -92,6 +92,8 @@ func New(opts ...Option) (*Source, error) {
 // etcd 可达但 key 不存在说明配置从未发布，不用快照顶替。
 // 快照必须通过完整性校验（yaml 可读、.meta 可解析、hash 配对）才算存在，没通过的内容不会进 Validator / OnCommit。
 func (s *Source) Load() ([]*config.KeyValue, error) {
+	start := time.Now()
+	defer func() { s.metrics.loadDuration.Observe(time.Since(start).Seconds()) }()
 	raw, rev, header, publishID, err := s.fetch(s.ctx)
 	if err == nil {
 		if err := s.commit(rev, raw, publishID); err != nil {
@@ -108,19 +110,23 @@ func (s *Source) Load() ([]*config.KeyValue, error) {
 	s.log.Warnf("etcd unavailable, starting from snapshot: %v", err)
 	snapRaw, snapRev, snapErr := s.snap.read()
 	if snapErr != nil {
+		s.metrics.countSnapshotFailure("read")
 		return nil, fmt.Errorf("%w (etcd: %v; snapshot: %v)", ErrNoConfig, err, snapErr)
 	}
 	if s.opts.validator != nil {
 		if verr := s.opts.validator(snapRev, snapRaw); verr != nil {
+			s.metrics.countCommitFailure("validator")
 			return nil, fmt.Errorf("confsource: snapshot rejected: %w", verr)
 		}
 	}
 	if cerr := s.runOnCommit(snapRev, snapRaw); cerr != nil {
+		s.metrics.countCommitFailure("oncommit")
 		return nil, fmt.Errorf("confsource: snapshot apply failed: %w", cerr)
 	}
 	s.committed.Store(snapRev)
 	s.committedHash.Store(contentHash(snapRaw))
 	s.metrics.loadedRevision.Set(float64(snapRev))
+	s.metrics.setContentHash(contentHash(snapRaw))
 	s.setDegraded(true)
 	return s.keyValues(snapRaw), nil
 }
@@ -159,6 +165,7 @@ func (s *Source) fetch(ctx context.Context) (raw []byte, rev, header int64, publ
 	if len(cfg.Kvs) == 0 {
 		return nil, 0, 0, "", fmt.Errorf("%w: key %s not found", ErrNoConfig, s.configKey)
 	}
+	s.metrics.markSync()
 	kv := cfg.Kvs[0]
 	return kv.Value, kv.ModRevision, resp.Header.Revision, publishIDFrom(resp.Responses[1].GetResponseRange()), nil
 }
@@ -169,6 +176,7 @@ func (s *Source) publishIDAt(rev int64) string {
 	defer cancel()
 	resp, err := s.client.Get(ctx, s.metaKey, clientv3.WithRev(rev))
 	if err != nil {
+		s.metrics.countMetaLookupFailure(err)
 		return ""
 	}
 	return publishIDFrom((*pb.RangeResponse)(resp))
@@ -193,18 +201,23 @@ func publishIDFrom(r *pb.RangeResponse) string {
 func (s *Source) commit(rev int64, raw []byte, publishID string) error {
 	if s.opts.validator != nil {
 		if err := s.opts.validator(rev, raw); err != nil {
+			s.metrics.countCommitFailure("validator")
 			return fmt.Errorf("confsource: revision %d rejected: %w", rev, err)
 		}
 	}
 	if err := s.runOnCommit(rev, raw); err != nil {
+		s.metrics.countCommitFailure("oncommit")
 		return fmt.Errorf("confsource: revision %d apply failed: %w", rev, err)
 	}
 	if err := s.snap.write(raw, snapshotMeta{ModRevision: rev, PublishID: publishID, SavedAt: time.Now()}); err != nil {
+		s.metrics.countSnapshotFailure("write")
 		s.log.Errorf("write snapshot failed: %v", err)
 	}
+	hash := contentHash(raw)
 	s.committed.Store(rev)
-	s.committedHash.Store(contentHash(raw))
+	s.committedHash.Store(hash)
 	s.metrics.loadedRevision.Set(float64(rev))
+	s.metrics.setContentHash(hash)
 	return nil
 }
 

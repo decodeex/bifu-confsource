@@ -536,8 +536,11 @@ func TestSource_ProgressNotifyAdvancesCursor(t *testing.T) {
 	require.NoError(t, err)
 	time.Sleep(300 * time.Millisecond)
 
+	before, _ := env.metric("confsource_last_sync_timestamp_seconds", svc())
 	head := env.bumpRevision(30)
 	time.Sleep(1 * time.Second)
+	after, _ := env.metric("confsource_last_sync_timestamp_seconds", svc())
+	require.Greater(t, after, before, "progress notifications must have reached the watcher (nothing was published on this key)")
 	env.compact(head)
 	env.restart()
 	time.Sleep(2 * time.Second)

@@ -42,18 +42,22 @@ func (w *watcher) Stop() error {
 }
 
 // run 事件循环。快照降级启动或游标为 0 时先 resync 再建 Watch；Watch 的 channel 一旦关闭（压缩、无 leader、取消）
-// 都先退避、再 resync、再重建 Watch，任何路径都不空转
+// 都先退避、再 resync、再重建 Watch，任何路径都不空转。
+// resyncReason 记的是这次 resync 为什么发生，失败重试不换原因，完成时按它计一次数
 func (w *watcher) run() {
 	wait := newBackoff(w.s.opts.backoffMin, w.s.opts.backoffMax)
-	needResync := w.s.Degraded() || w.s.cursor.Load() == 0
+	resyncReason := ""
+	if w.s.Degraded() || w.s.cursor.Load() == 0 {
+		resyncReason = resyncStartup
+	}
 	for w.ctx.Err() == nil {
-		if needResync {
-			if err := w.resync(); err != nil {
+		if resyncReason != "" {
+			if err := w.resync(resyncReason); err != nil {
 				w.s.log.Warnf("resync failed, retry in %s: %v", wait.current(), err)
 				wait.sleep(w.ctx)
 				continue
 			}
-			needResync = false
+			resyncReason = ""
 			wait.reset()
 		}
 
@@ -63,25 +67,29 @@ func (w *watcher) run() {
 		}
 		if compacted {
 			w.s.log.Warnf("watch revision compacted, reloading full config in %s", wait.current())
+			resyncReason = resyncCompacted
 		} else {
 			w.s.log.Warnf("watch interrupted, resync in %s: %v", wait.current(), err)
+			resyncReason = resyncReconnect
 		}
 		wait.sleep(w.ctx)
-		needResync = true
 	}
 }
 
 // resync 全量拉取，用于降级恢复与 Watch 关闭后重建起点。
 // 游标一律对齐到本次响应头的集群 revision；集群 revision 比游标还低说明 etcd 被恢复到了更早的状态，记错误但不动内存。
 // etcd 上是更新的 ModRevision 才提交并交付；不高于内存的只在内容与内存一致时才算核对通过、清 degraded，不一致既不采用也不清
-func (w *watcher) resync() error {
+func (w *watcher) resync(reason string) error {
 	raw, rev, header, publishID, err := w.s.fetch(w.ctx)
 	if err != nil {
 		return err
 	}
 	if cursor := w.s.cursor.Load(); header < cursor {
 		w.s.log.Errorf("revision regressed: cluster revision %d is below watch cursor %d, keeping committed revision %d; realign from the platform is required", header, cursor, w.s.Revision())
+		w.s.metrics.regressed.Inc()
+		reason = resyncRegression
 	}
+	w.s.metrics.countResync(reason)
 	w.s.cursor.Store(header)
 
 	committed := w.s.Revision()
@@ -119,6 +127,7 @@ func (w *watcher) watch(wait *backoff) (compacted bool, err error) {
 			return false, err
 		}
 		wait.reset()
+		w.s.metrics.markSync()
 		if resp.Created {
 			continue
 		}
@@ -132,6 +141,7 @@ func (w *watcher) watch(wait *backoff) (compacted bool, err error) {
 				w.s.log.Errorf("config key deleted in etcd, ignoring and keeping revision %d", w.s.Revision())
 			case ev.Kv.ModRevision <= w.s.Revision():
 				w.s.log.Debugf("skip stale revision %d, committed %d", ev.Kv.ModRevision, w.s.Revision())
+				w.s.metrics.eventsSkipped.Inc()
 				if w.s.Degraded() && w.s.sameAsCommitted(ev.Kv.Value) {
 					w.s.setDegraded(false)
 				}
