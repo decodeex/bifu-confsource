@@ -81,6 +81,7 @@ func New(opts ...Option) (*Source, error) {
 
 // Load 首次加载：优先 etcd，etcd 不可达时用本地快照降级启动，两者都不可用返回 ErrNoConfig。
 // etcd 可达但 key 不存在说明配置从未发布，不用快照顶替。
+// 快照必须通过完整性校验（yaml 可读、.meta 可解析、hash 配对）才算存在，没通过的内容不会进 Validator / OnCommit。
 func (s *Source) Load() ([]*config.KeyValue, error) {
 	raw, rev, publishID, err := s.fetch(s.ctx)
 	if err == nil {

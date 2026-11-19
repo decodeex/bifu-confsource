@@ -94,7 +94,7 @@ func TestSource_SnapshotFallbackAndRecovery(t *testing.T) {
 }
 
 // 快照与 meta 不配对时仍可启动，但 revision 视为 0，恢复后强制全量拉取
-func TestSource_UnpairedSnapshotStartsWithRevisionZero(t *testing.T) {
+func TestSource_UnpairedSnapshotIsNoConfig(t *testing.T) {
 	env := newTestEnv(t)
 	env.publish(yamlA, "pub-a")
 
@@ -104,28 +104,24 @@ func TestSource_UnpairedSnapshotStartsWithRevisionZero(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, warm.Close())
 
-	revB := env.publish(yamlB, "pub-b")
+	env.publish(yamlB, "pub-b")
 	env.stop()
 	overwriteSnapshot(t, env, yamlC)
 
-	src, err := confsource.New(env.options()...)
+	validated := 0
+	src, err := confsource.New(env.options(confsource.WithValidator(func(int64, []byte) error {
+		validated++
+		return nil
+	}))...)
 	require.NoError(t, err)
 	defer src.Close()
 
-	kvs, err := src.Load()
-	require.NoError(t, err)
-	require.Equal(t, yamlC, string(kvs[0].Value))
+	_, err = src.Load()
+	require.ErrorIs(t, err, confsource.ErrNoConfig, "a snapshot whose hash does not pair with .meta is no snapshot")
+	require.Contains(t, err.Error(), "hash 不配对")
+	require.Zero(t, validated, "unverified content never reaches the Validator")
 	require.Zero(t, src.Revision())
-	require.True(t, src.Degraded())
-
-	w, err := src.Watch()
-	require.NoError(t, err)
-	env.restart()
-
-	kvs = nextWithin(t, w, 10*time.Second)
-	require.Equal(t, yamlB, string(kvs[0].Value), "recovery must fetch the real current config")
-	require.Eventually(t, func() bool { return !src.Degraded() }, 5*time.Second, 20*time.Millisecond)
-	env.assertCommitted(src, revB, yamlB)
+	require.False(t, src.Degraded(), "nothing was loaded, so nothing is degraded")
 }
 
 // Watch 起点已被 compaction 清掉时，改为全量拉取当前值再从最新 revision 续订
