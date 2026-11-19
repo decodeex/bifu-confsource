@@ -3,6 +3,7 @@ package confsource_test
 import (
 	"errors"
 	"fmt"
+	"github.com/go-kratos/kratos/v2/config"
 	"strings"
 	"testing"
 	"time"
@@ -308,4 +309,178 @@ func TestSource_OnCommitRunsEvenWhenSnapshotAlreadyAhead(t *testing.T) {
 	require.Equal(t, yamlB, string(kvs[0].Value))
 	require.Equal(t, []int64{revA, revB}, committedRevs, "OnCommit must run even though the disk already had B")
 	env.assertCommitted(src, revB, yamlB)
+}
+
+// 集群 revision 越过 Watch 起点被压缩、配置本身没有新版本：resync 一次就把游标抬到集群 revision，不在 ErrCompacted 与 resync 之间空转
+func TestSource_CompactionBeyondCursorDoesNotSpin(t *testing.T) {
+	env := newTestEnv(t)
+	revA := env.publish(yamlA, "pub-a")
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+
+	head := env.bumpRevision(30)
+	env.compact(head)
+	// 已同步的 watcher 不受 compaction 影响，重启 etcd 让 Watch 重新注册，起点才会撞上压缩点
+	env.restart()
+	time.Sleep(3 * time.Second)
+
+	require.Equal(t, revA, src.Revision(), "nothing new to commit")
+	require.False(t, src.Degraded())
+	require.LessOrEqual(t, env.logCount("compacted"), 2, "one resync should settle the cursor; more means spinning:\n%s", env.logs.String())
+
+	revB := env.publish(yamlB, "pub-b")
+	kvs := nextWithin(t, w, 10*time.Second)
+	require.Equal(t, yamlB, string(kvs[0].Value))
+	env.assertCommitted(src, revB, yamlB)
+}
+
+// 校验被拒的版本也推进监听游标：压缩越过它之后不会把同一个坏版本反复送回来，下一个合法版本照常生效
+func TestSource_RejectedVersionStillAdvancesCursor(t *testing.T) {
+	env := newTestEnv(t)
+	revA := env.publish(yamlA, "pub-a")
+	src, err := confsource.New(env.options(confsource.WithValidator(func(_ int64, raw []byte) error {
+		if string(raw) == yamlB {
+			return errors.New("yamlB rejected")
+		}
+		return nil
+	}))...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+
+	revB := env.publish(yamlB, "pub-b")
+	require.Eventually(t, func() bool { return env.logCount("staying on revision") >= 1 }, 5*time.Second, 20*time.Millisecond)
+	require.Equal(t, revA, src.Revision(), "rejected version must not be committed")
+	env.compact(revB)
+	env.restart()
+	time.Sleep(3 * time.Second)
+	require.Equal(t, 1, env.logCount("staying on revision"), "the rejected version must not be re-delivered after compaction:\n%s", env.logs.String())
+	require.LessOrEqual(t, env.logCount("compacted"), 2)
+
+	revC := env.publish(yamlC, "pub-c")
+	kvs := nextWithin(t, w, 10*time.Second)
+	require.Equal(t, yamlC, string(kvs[0].Value))
+	env.assertCommitted(src, revC, yamlC)
+}
+
+// etcd 被不带 bump 恢复到更早的状态（revision 倒退、内容不同）：内存与快照保持已提交的版本，倒退后的内容既不采用也不交付，循环不空转。
+// 这条路径客户端自己发现不了（重新注册的 Watch 起点在未来，channel 不关），由平台对账第 6 行告警，恢复规程要求带 bump 恢复
+func TestSource_FreshClusterBelowCommittedIsNotAdopted(t *testing.T) {
+	env := newTestEnv(t)
+	env.bumpRevision(20)
+	revA := env.publish(yamlA, "pub-a")
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+
+	env.restartFresh()
+	revOld := env.publish(yamlC, "pub-old")
+	require.Less(t, revOld, revA, "the fresh cluster is behind the committed revision")
+	select {
+	case <-time.After(2 * time.Second):
+	case kvs := <-deliveries(w):
+		t.Fatalf("a version with ModRevision below the committed one must not be delivered: %q", kvs[0].Value)
+	}
+	require.Equal(t, revA, src.Revision(), "committed revision never goes backwards")
+	require.Equal(t, yamlA, env.snapshot(), "snapshot keeps the committed content")
+	require.False(t, src.Degraded())
+	require.Zero(t, env.logCount("compacted"))
+	require.Zero(t, env.logCount("resync failed"))
+}
+
+// 快照降级启动后 etcd 上是更老且不同的内容：不清 degraded、不采用；只有 etcd 给出更高的 ModRevision（带 bump 恢复后平台对齐）才提交并恢复
+func TestSource_DegradedNotClearedByOlderDifferentContent(t *testing.T) {
+	env := newTestEnv(t)
+	env.bumpRevision(20)
+	revA := env.publish(yamlA, "pub-a")
+	warm, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	_, err = warm.Load()
+	require.NoError(t, err)
+	require.NoError(t, warm.Close())
+	env.stop()
+
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	defer src.Close()
+	kvs, err := src.Load()
+	require.NoError(t, err)
+	require.Equal(t, yamlA, string(kvs[0].Value))
+	require.True(t, src.Degraded())
+	w, err := src.Watch()
+	require.NoError(t, err)
+
+	env.dataDir = t.TempDir()
+	env.start()
+	env.publish(yamlC, "pub-older")
+	require.Eventually(t, func() bool { return env.logCount("differs from committed") >= 1 }, 10*time.Second, 50*time.Millisecond, "resync must notice the mismatch:\n%s", env.logs.String())
+	time.Sleep(1 * time.Second)
+	require.True(t, src.Degraded(), "different content at a lower revision is not a confirmation")
+	require.Equal(t, revA, src.Revision())
+	require.Equal(t, yamlA, env.snapshot())
+	require.LessOrEqual(t, env.logCount("differs from committed"), 2, "mismatch is reported once per resync, not in a loop")
+
+	env.bumpRevision(40)
+	revNew := env.publish(yamlB, "pub-new")
+	require.Greater(t, revNew, revA)
+	got := nextWithin(t, w, 10*time.Second)
+	require.Equal(t, yamlB, string(got[0].Value))
+	require.Eventually(t, func() bool { return !src.Degraded() }, 5*time.Second, 20*time.Millisecond)
+	env.assertCommitted(src, revNew, yamlB)
+}
+
+// 快照降级启动、etcd 回来后内容没变：resync 核对哈希一致即清 degraded，不重复提交
+func TestSource_DegradedClearsWhenEtcdUnchanged(t *testing.T) {
+	env := newTestEnv(t)
+	revA := env.publish(yamlA, "pub-a")
+	warm, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	_, err = warm.Load()
+	require.NoError(t, err)
+	require.NoError(t, warm.Close())
+	env.stop()
+
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	require.True(t, src.Degraded())
+	w, err := src.Watch()
+	require.NoError(t, err)
+
+	env.restart()
+	require.Eventually(t, func() bool { return !src.Degraded() }, 10*time.Second, 50*time.Millisecond)
+	require.Equal(t, revA, src.Revision())
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case kvs := <-deliveries(w):
+		t.Fatalf("unchanged content must not be re-delivered: %q", kvs[0].Value)
+	}
+}
+
+// deliveries 把 Watcher 的下一次交付转成 channel，方便在 select 里等「不应该来的」事件
+func deliveries(w config.Watcher) <-chan []*config.KeyValue {
+	ch := make(chan []*config.KeyValue, 1)
+	go func() {
+		if kvs, err := w.Next(); err == nil {
+			ch <- kvs
+		}
+	}()
+	return ch
 }

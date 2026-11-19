@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -96,6 +97,32 @@ func (e *testEnv) start() {
 	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{e.endpoint()}, DialTimeout: 2 * time.Second})
 	require.NoError(e.t, err)
 	e.cli = cli
+}
+
+// restartFresh 换一个空数据目录重启：模拟从很早的备份恢复，集群 revision 倒退到 1
+func (e *testEnv) restartFresh() {
+	e.t.Helper()
+	e.stop()
+	e.dataDir = e.t.TempDir()
+	e.start()
+}
+
+// bumpRevision 往无关 key 写 n 次，只抬集群 revision，不动配置 key 的 ModRevision
+func (e *testEnv) bumpRevision(n int) int64 {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var last int64
+	for i := 0; i < n; i++ {
+		resp, err := e.cli.Put(ctx, "/other/noise", fmt.Sprint(i))
+		require.NoError(e.t, err)
+		last = resp.Header.Revision
+	}
+	return last
+}
+
+func (e *testEnv) logCount(substr string) int {
+	return strings.Count(e.logs.String(), substr)
 }
 
 // stop 关闭 etcd 与测试客户端，重复调用安全；embed.Etcd.Close 本身不能调两次

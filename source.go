@@ -31,7 +31,12 @@ type Source struct {
 
 	// committed 已通过校验并写入快照的最新 revision；快照与 meta 不配对时为 0
 	committed atomic.Int64
-	degraded  atomic.Bool
+	// committedHash 内存里正在生效那版配置的内容哈希，resync 时用来核对 etcd 内容是否与内存一致
+	committedHash atomic.Value
+	// cursor 监听游标：最近一次从 etcd 看到的集群 revision，下次 Watch 从 cursor+1 开始。
+	// 严格按 clientv3 的 nextRev 规则推进（事件取最后一个事件的 ModRevision，进度通知取响应头），与 committed 分开
+	cursor   atomic.Int64
+	degraded atomic.Bool
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -83,11 +88,12 @@ func New(opts ...Option) (*Source, error) {
 // etcd 可达但 key 不存在说明配置从未发布，不用快照顶替。
 // 快照必须通过完整性校验（yaml 可读、.meta 可解析、hash 配对）才算存在，没通过的内容不会进 Validator / OnCommit。
 func (s *Source) Load() ([]*config.KeyValue, error) {
-	raw, rev, publishID, err := s.fetch(s.ctx)
+	raw, rev, header, publishID, err := s.fetch(s.ctx)
 	if err == nil {
 		if err := s.commit(rev, raw, publishID); err != nil {
 			return nil, err
 		}
+		s.cursor.Store(header)
 		s.setDegraded(false)
 		return s.keyValues(raw), nil
 	}
@@ -109,6 +115,7 @@ func (s *Source) Load() ([]*config.KeyValue, error) {
 		return nil, fmt.Errorf("confsource: snapshot apply failed: %w", cerr)
 	}
 	s.committed.Store(snapRev)
+	s.committedHash.Store(contentHash(snapRaw))
 	s.metrics.loadedRevision.Set(float64(snapRev))
 	s.setDegraded(true)
 	return s.keyValues(snapRaw), nil
@@ -136,20 +143,20 @@ func (s *Source) Close() error {
 	return s.client.Close()
 }
 
-// fetch 在同一事务里读配置与 meta，保证两者来自同一 revision
-func (s *Source) fetch(ctx context.Context) (raw []byte, rev int64, publishID string, err error) {
+// fetch 在同一事务里读配置与 meta，保证两者来自同一 revision；header 是响应头里的集群 revision，给监听游标用
+func (s *Source) fetch(ctx context.Context) (raw []byte, rev, header int64, publishID string, err error) {
 	ctx, cancel := context.WithTimeout(ctx, s.opts.timeout)
 	defer cancel()
 	resp, err := s.client.Txn(ctx).Then(clientv3.OpGet(s.configKey), clientv3.OpGet(s.metaKey)).Commit()
 	if err != nil {
-		return nil, 0, "", err
+		return nil, 0, 0, "", err
 	}
 	cfg := resp.Responses[0].GetResponseRange()
 	if len(cfg.Kvs) == 0 {
-		return nil, 0, "", fmt.Errorf("%w: key %s not found", ErrNoConfig, s.configKey)
+		return nil, 0, 0, "", fmt.Errorf("%w: key %s not found", ErrNoConfig, s.configKey)
 	}
 	kv := cfg.Kvs[0]
-	return kv.Value, kv.ModRevision, publishIDFrom(resp.Responses[1].GetResponseRange()), nil
+	return kv.Value, kv.ModRevision, resp.Header.Revision, publishIDFrom(resp.Responses[1].GetResponseRange()), nil
 }
 
 // publishIDAt 取某个 revision 时 meta 里的 publish_id；拿不到返回空，不影响加载
@@ -192,8 +199,15 @@ func (s *Source) commit(rev int64, raw []byte, publishID string) error {
 		s.log.Errorf("write snapshot failed: %v", err)
 	}
 	s.committed.Store(rev)
+	s.committedHash.Store(contentHash(raw))
 	s.metrics.loadedRevision.Set(float64(rev))
 	return nil
+}
+
+// sameAsCommitted 内容哈希是否与内存里正在生效的版本一致
+func (s *Source) sameAsCommitted(raw []byte) bool {
+	h, _ := s.committedHash.Load().(string)
+	return h != "" && h == contentHash(raw)
 }
 
 // runOnCommit 调用提交回调，panic 一律按返回错误处理，事件循环不能因为加载器的 bug 停掉
