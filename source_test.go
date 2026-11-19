@@ -1,9 +1,11 @@
 package confsource_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/go-kratos/kratos/v2/config"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -476,11 +478,197 @@ func TestSource_DegradedClearsWhenEtcdUnchanged(t *testing.T) {
 
 // deliveries 把 Watcher 的下一次交付转成 channel，方便在 select 里等「不应该来的」事件
 func deliveries(w config.Watcher) <-chan []*config.KeyValue {
-	ch := make(chan []*config.KeyValue, 1)
+	return sinkOf(w).ch
+}
+
+// watchSink 持续消费 Watcher 的交付，测试按超时从它这里取或断言没有。
+// 直接起 goroutine 调一次 Next 再超时放弃的话，那个 goroutine 会残留并偷走下一次交付
+type watchSink struct {
+	ch chan []*config.KeyValue
+}
+
+func sinkOf(w config.Watcher) *watchSink {
+	s := &watchSink{ch: make(chan []*config.KeyValue, 16)}
 	go func() {
-		if kvs, err := w.Next(); err == nil {
-			ch <- kvs
+		for {
+			kvs, err := w.Next()
+			if err != nil {
+				return
+			}
+			s.ch <- kvs
 		}
 	}()
-	return ch
+	return s
+}
+
+func (s *watchSink) next(t testingT, d time.Duration) []*config.KeyValue {
+	t.Helper()
+	select {
+	case kvs := <-s.ch:
+		return kvs
+	case <-time.After(d):
+		t.Fatalf("no config delivered within %s", d)
+		return nil
+	}
+}
+
+func (s *watchSink) none(t testingT, d time.Duration, why string) {
+	t.Helper()
+	select {
+	case kvs := <-s.ch:
+		t.Fatalf("%s: %q", why, kvs[0].Value)
+	case <-time.After(d):
+	}
+}
+
+// 进度通知推进游标：长期没有发布时游标也跟着集群 revision 走，压缩再重连不会撞到压缩点
+func TestSource_ProgressNotifyAdvancesCursor(t *testing.T) {
+	env := newTestEnv(t)
+	env.progressNotify = 200 * time.Millisecond
+	env.restart()
+	env.publish(yamlA, "pub-a")
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+
+	head := env.bumpRevision(30)
+	time.Sleep(1 * time.Second)
+	env.compact(head)
+	env.restart()
+	time.Sleep(2 * time.Second)
+	require.Zero(t, env.logCount("compacted"), "cursor must have followed progress notifications past the compaction point:\n%s", env.logs.String())
+
+	revB := env.publish(yamlB, "pub-b")
+	got := nextWithin(t, w, 10*time.Second)
+	require.Equal(t, yamlB, string(got[0].Value))
+	env.assertCommitted(src, revB, yamlB)
+}
+
+// 静默断连：连接还在但字节再也不通。gRPC 心跳判定连接已死后由 clientv3 内部重连并续订，
+// confsource 的循环全程不知情，断连期间的发布在恢复后照常到达
+func TestSource_SilentDisconnectRecoversByKeepalive(t *testing.T) {
+	env := newTestEnv(t)
+	proxy := newTCPProxy(t, fmt.Sprintf("127.0.0.1:%d", env.clientPort))
+	env.publish(yamlA, "pub-a")
+	src, err := confsource.New(env.options(
+		confsource.WithEndpoints(proxy.addr()),
+		confsource.WithKeepAlive(10*time.Second, time.Second),
+	)...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	sink := sinkOf(w)
+	time.Sleep(300 * time.Millisecond)
+
+	proxy.freezeExisting()
+	revB := env.publish(yamlB, "pub-b")
+	sink.none(t, 2*time.Second, "the frozen connection must not deliver anything")
+
+	got := sink.next(t, 40*time.Second)
+	require.Equal(t, yamlB, string(got[0].Value))
+	env.assertCommitted(src, revB, yamlB)
+	require.Zero(t, env.logCount("watch interrupted"), "recovery is clientv3's job, the channel must not close:\n%s", env.logs.String())
+	require.Zero(t, env.logCount("resync"))
+}
+
+// 成员失去 leader：WithRequireLeader 让服务端取消流，循环退避 resync（失败也退避）直到 leader 回来，再重建 Watch；
+// 全程不进降级态，不空转
+func TestSource_NoLeaderClosesWatchAndRecovers(t *testing.T) {
+	env := newClusterEnv(t, 2)
+	env.publish(yamlA, "pub-a")
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+
+	env.stopMember(1)
+	require.Eventually(t, func() bool { return env.logCount("no leader") >= 1 }, 30*time.Second, 100*time.Millisecond, "the watch must be cancelled once the member has no leader:\n%s", env.logs.String())
+	require.False(t, src.Degraded(), "losing the connection is not degraded")
+	time.Sleep(2 * time.Second)
+
+	env.startMember(1)
+	env.waitLeader()
+	revB := env.publish(yamlB, "pub-b")
+	got := nextWithin(t, w, 20*time.Second)
+	require.Equal(t, yamlB, string(got[0].Value))
+	env.assertCommitted(src, revB, yamlB)
+	require.Less(t, env.logCount("resync failed"), 30, "resync retries must back off:\n%s", env.logs.String())
+}
+
+// revision 倒退的检测分支：不带 bump 恢复后客户端本来发现不了，直到某次 channel 关闭（这里用失去 leader）触发 resync，
+// resync 看到集群 revision 低于游标就记「revision regressed」，内容不采用；带更高 ModRevision 的新发布到来后恢复
+func TestSource_RevisionRegressionIsDetectedOnResync(t *testing.T) {
+	env := newClusterEnv(t, 2)
+	env.bumpRevision(20)
+	revA := env.publish(yamlA, "pub-a")
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	defer src.Close()
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	sink := sinkOf(w)
+	time.Sleep(300 * time.Millisecond)
+
+	env.restartFresh()
+	revOld := env.publish(yamlC, "pub-old")
+	require.Less(t, revOld, revA)
+	env.stopMember(1)
+	require.Eventually(t, func() bool { return env.logCount("no leader") >= 1 }, 30*time.Second, 100*time.Millisecond, "watch must be cancelled:\n%s", env.logs.String())
+	env.startMember(1)
+	env.waitLeader()
+
+	require.Eventually(t, func() bool { return env.logCount("revision regressed") >= 1 }, 30*time.Second, 100*time.Millisecond, "resync must report the regression:\n%s", env.logs.String())
+	require.Equal(t, revA, src.Revision(), "regressed content is not adopted")
+	require.Equal(t, yamlA, env.snapshot())
+	require.False(t, src.Degraded())
+	sink.none(t, 1*time.Second, "regressed content must not be delivered")
+
+	env.bumpRevision(40)
+	revNew := env.publish(yamlB, "pub-new")
+	require.Greater(t, revNew, revA)
+	got := sink.next(t, 20*time.Second)
+	require.Equal(t, yamlB, string(got[0].Value))
+	env.assertCommitted(src, revNew, yamlB)
+}
+
+// Close 释放资源：事件循环正在退避等待 etcd 时 Close 也立刻返回，Next 随之报错，goroutine 不残留
+func TestSource_CloseReleasesWatcherDuringBackoff(t *testing.T) {
+	env := newTestEnv(t)
+	env.publish(yamlA, "pub-a")
+	before := runtime.NumGoroutine()
+	src, err := confsource.New(env.options()...)
+	require.NoError(t, err)
+	_, err = src.Load()
+	require.NoError(t, err)
+	w, err := src.Watch()
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+
+	env.stop()
+	time.Sleep(500 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() { done <- src.Close() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close must not wait for the backoff to elapse")
+	}
+	_, err = w.Next()
+	require.ErrorIs(t, err, context.Canceled)
+	require.Eventually(t, func() bool { return runtime.NumGoroutine() <= before+2 }, 10*time.Second, 100*time.Millisecond, "goroutines after Close: %d, before New: %d", runtime.NumGoroutine(), before)
 }

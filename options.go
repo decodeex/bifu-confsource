@@ -35,6 +35,9 @@ type options struct {
 	registerer  prometheus.Registerer
 	backoffMin  time.Duration
 	backoffMax  time.Duration
+	// keepAliveTime 连接空闲多久后发 gRPC 心跳 ping，0 表示不开心跳；keepAliveTimeout 等 ping 回应的时限
+	keepAliveTime    time.Duration
+	keepAliveTimeout time.Duration
 }
 
 const (
@@ -42,6 +45,9 @@ const (
 	defaultTimeout     = 3 * time.Second
 	defaultBackoffMin  = time.Second
 	defaultBackoffMax  = 30 * time.Second
+	// 心跳默认值：连接死掉后最晚在 time+timeout 左右被 gRPC 判定，之后由 clientv3 重连
+	defaultKeepAliveTime    = 30 * time.Second
+	defaultKeepAliveTimeout = 10 * time.Second
 )
 
 func defaultOptions() options {
@@ -52,6 +58,9 @@ func defaultOptions() options {
 		registerer:  prometheus.DefaultRegisterer,
 		backoffMin:  defaultBackoffMin,
 		backoffMax:  defaultBackoffMax,
+
+		keepAliveTime:    defaultKeepAliveTime,
+		keepAliveTimeout: defaultKeepAliveTimeout,
 	}
 }
 
@@ -120,5 +129,15 @@ func WithBackoff(minWait, maxWait time.Duration) Option {
 	return func(o *options) {
 		o.backoffMin = minWait
 		o.backoffMax = maxWait
+	}
+}
+
+// WithKeepAlive gRPC 连接层心跳：连接空闲 keepAliveTime 后发 ping，keepAliveTimeout 内没有回应即判定连接已死，
+// 由 clientv3 内部重连并续订 Watch。默认 30 s / 10 s；keepAliveTime 传 0 关闭心跳。
+// gRPC 客户端会把小于 10 s 的 keepAliveTime 抬到 10 s；etcd 服务端默认拒绝比 5 s 更密的 ping
+func WithKeepAlive(keepAliveTime, keepAliveTimeout time.Duration) Option {
+	return func(o *options) {
+		o.keepAliveTime = keepAliveTime
+		o.keepAliveTimeout = keepAliveTimeout
 	}
 }

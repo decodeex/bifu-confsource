@@ -61,6 +61,10 @@ func New(opts ...Option) (*Source, error) {
 		TLS:         o.tls,
 		Username:    o.username,
 		Password:    o.password,
+		// 连接层心跳：静默断连（连接还在、字节不通）只能靠它发现，判死后 clientv3 自己重连并续订 Watch
+		DialKeepAliveTime:    o.keepAliveTime,
+		DialKeepAliveTimeout: o.keepAliveTimeout,
+		PermitWithoutStream:  o.keepAliveTime > 0,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("confsource: etcd client: %w", err)

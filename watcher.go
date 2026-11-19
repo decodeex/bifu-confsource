@@ -105,11 +105,13 @@ func (w *watcher) resync() error {
 
 // watch 从游标的下一版开始监听；返回 compacted=true 表示起点已被压缩，需要全量重拉。
 // 游标按 clientv3 的 nextRev 规则推进：创建响应不推进；有事件取最后一个事件的 ModRevision；
-// 没有事件的进度通知取响应头。校验被拒的版本一样推进游标，否则重建 Watch 会把同一个坏版本再送一遍
+// 没有事件的进度通知取响应头。校验被拒的版本一样推进游标，否则重建 Watch 会把同一个坏版本再送一遍。
+// WithRequireLeader：所连成员失去 leader 时服务端取消这条流，channel 关闭回到 run 退避重建，而不是挂在一个孤立成员上；
+// WithProgressNotify：长期没有发布时服务端也定期推只带响应头的通知，游标跟着集群 revision 走
 func (w *watcher) watch(wait *backoff) (compacted bool, err error) {
-	ctx, cancel := context.WithCancel(w.ctx)
+	ctx, cancel := context.WithCancel(clientv3.WithRequireLeader(w.ctx))
 	defer cancel()
-	for resp := range w.s.client.Watch(ctx, w.s.configKey, clientv3.WithRev(w.s.cursor.Load()+1)) {
+	for resp := range w.s.client.Watch(ctx, w.s.configKey, clientv3.WithRev(w.s.cursor.Load()+1), clientv3.WithProgressNotify()) {
 		if resp.CompactRevision != 0 || errors.Is(resp.Err(), rpctypes.ErrCompacted) {
 			return true, resp.Err()
 		}

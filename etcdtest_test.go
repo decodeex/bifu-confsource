@@ -25,9 +25,22 @@ import (
 
 const testService = "content"
 
+// testingT 测试辅助函数需要的 *testing.T 子集
+type testingT interface {
+	Helper()
+	TempDir() string
+	Cleanup(func())
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+	Errorf(format string, args ...any)
+	FailNow()
+	Failed() bool
+	Log(args ...any)
+}
+
 // testEnv 一个内嵌 etcd 加上 confsource 需要的全部外围：快照目录、指标注册器、日志缓冲
 type testEnv struct {
-	t          *testing.T
+	t          testingT
 	dataDir    string
 	clientPort int
 	peerPort   int
@@ -36,6 +49,8 @@ type testEnv struct {
 	snapshots  string
 	registry   *prometheus.Registry
 	logs       *logBuffer
+	// progressNotify 服务端进度通知间隔，0 用 etcd 默认（10 min，测试里等于不发）
+	progressNotify time.Duration
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -51,7 +66,17 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	env.start()
 	t.Cleanup(env.stop)
+	env.dumpLogsOnFailure()
 	return env
+}
+
+// dumpLogsOnFailure 用例失败时把 confsource 的日志整段打出来，省得每条断言都带日志
+func (e *testEnv) dumpLogsOnFailure() {
+	e.t.Cleanup(func() {
+		if e.t.Failed() {
+			e.t.Log("confsource logs:\n" + e.logs.String())
+		}
+	})
 }
 
 func (e *testEnv) endpoint() string {
@@ -83,6 +108,7 @@ func (e *testEnv) start() {
 	cfg.ListenPeerUrls = []url.URL{mustURL(e.t, fmt.Sprintf("http://127.0.0.1:%d", e.peerPort))}
 	cfg.AdvertisePeerUrls = cfg.ListenPeerUrls
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
+	cfg.ExperimentalWatchProgressNotifyInterval = e.progressNotify
 
 	etcd, err := embed.StartEtcd(cfg)
 	require.NoError(e.t, err)
@@ -225,14 +251,14 @@ func nextWithin(t *testing.T, w config.Watcher, d time.Duration) []*config.KeyVa
 	}
 }
 
-func mustURL(t *testing.T, raw string) url.URL {
+func mustURL(t testingT, raw string) url.URL {
 	t.Helper()
 	u, err := url.Parse(raw)
 	require.NoError(t, err)
 	return *u
 }
 
-func freePort(t *testing.T) int {
+func freePort(t testingT) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
