@@ -61,18 +61,20 @@ description: bifu-confsource（统一配置平台的 Kratos config.Source 客户
 |---|---|---|---|
 | Watch 游标 | 下一次 Watch 从哪个 revision 开始订阅 | 严格按 clientv3 的规则：`WatchResponse.Header.Revision` 或最后一个事件的 `ModRevision`，加一；**不用 Committed Revision 推算** | 事件循环的局部状态 |
 | Committed Revision | 内存里正在生效的那版配置的 etcd `ModRevision`，`Source.Revision()` 与 `confsource_loaded_revision` 返回的就是它 | 只在 Validator 与 OnCommit 都成功后推进 | `Source.committed`（原子） |
-| Snapshot Revision | 磁盘快照 meta 里的 `mod_revision` | 只在 commit 成功后尽力写入，写失败只记日志 | `{snapshotDir}/{service}.yaml.meta` |
+| Snapshot Revision | 磁盘快照 meta 里的 `mod_revision`；hostPath 由同节点多个 Pod 共享，写入者是最先 Store 成功该版本的实例 | 只由 Validator 与 OnCommit 都成功的实例写入，flock 下按 revision 单调跳过旧版；写失败只记日志 | `{snapshotDir}/{service}.yaml.meta` |
 
 规则：
 - Watch 游标只跟 etcd 事件流走。**某一版校验失败时，游标照常推进、Committed Revision 不动**，这样坏版本不会被反复重投，下一版到来时正常处理；全量 resync 之后游标重新以 resync 读到的 header revision 为准。
 - Committed Revision 只升不降；revision 倒退（灾备恢复后 etcd 的 revision 比内存小）只能通过全量 resync 发现，按 ModRevision 单调规则处理，**不采用内容、不猜测**。
-- Snapshot Revision 永远不高于 Committed Revision，可以落后（写失败）；快照 meta 缺失、损坏或与内容 hash 不配对时内容仍可用但 revision 视为 0，之后必须全量 resync，不能按它续订。
+- 快照单调性只对**写入它的那个实例**成立：写入的一定是该实例已 Store 成功的版本，不会高于它自己的 Committed Revision。同节点另一副本可能还停在上一版，它的 Committed Revision 可以低于磁盘上的 Snapshot Revision，这是正常的；它收到同一事件后照常校验、Store，写盘时按单调检查跳过。不要写「快照不高于内存」这种跨实例的断言。
+- **快照完整性校验不得削弱**：yaml 缺失或读不到 → `ErrSnapshotMissing`，Load 时转成 `ErrNoConfig` 拒绝启动；meta 缺失、损坏或与内容 hash 不配对 → 按系分现行规则，内容只能作为「未与 etcd 核对的降级内容」使用，revision 一律视为 0，**不得拿 meta 里的 revision 续订 Watch、不得据此置 degraded=0**，重连后必须全量 Get。任何版本都不能用「兼容旧格式」为理由跳过 hash 校验。
 - compaction（`ErrCompacted` / `CompactRevision != 0`）一律全量 resync 后重建 Watch 起点；断连、compaction、resync 失败都走退避，不空转。
 
 **degraded 的语义只有一条**：内存里的配置来自本地快照、尚未与 etcd 核对过。它与「etcd 连接是否健康」「快照是否写成功」无关：
 - 置 1 只发生在 Load 阶段 etcd 不可达、改用快照启动时；快照内容仍要过 Validator 与 OnCommit，过不了就是 `ErrNoConfig`，不以空配置启动。
-- 置 0 的条件是一次成功的全量 resync：从 etcd 读到配置，且内存版本不落后于 etcd（需要时先 commit 并交付给 Kratos）。只是连上了不算。
+- 置 0 的条件是一次成功的全量 resync 并确认**实际配置一致**：etcd 版本更新时，commit 成功并交付 Kratos 后置 0；etcd 的 ModRevision 不高于内存时，必须比对内容哈希与内存已提交版本一致才置 0；哈希不一致说明 revision 倒退或 etcd 被改过，告警、不采用内容、degraded 保持原值。只比 revision 大小不算核对，只是连上了更不算。
 - Watch 运行中断连**不**置 degraded，内存里仍是最后一版已提交的配置；连接健康用专门的指标表达，不复用 degraded。
+- **Watch 流存在不代表连接健康**：clientv3 在传输层断连时内部自动重建流并续订，对调用方不可见，`Watch()` 返回的 channel 在整个断连期间保持打开、不报错；只有 compaction、`WithRequireLeader` 下无 leader、ctx 取消三种情况才关闭 channel。所以「channel 还开着」「循环还在跑」都不能当健康信号；健康要靠 keepalive 探活、进度通知的新鲜度（距上次收到响应多久）和对应指标来判断，静默断连只能从这些信号发现。
 - 三件事分开看：etcd 连接健康（Watch 流在不在）、业务内存生效（Committed Revision）、快照持久化（尽力而为）。写规则或指标时说清楚指的是哪一件。
 
 **commit 顺序固定**：Validator → OnCommit（加载器 Store 是最后一步）→ 写快照 → 推进 Committed Revision 与指标。校验或回调失败时内存、快照、revision、指标一起停在上一版；回调 panic 按错误处理，事件循环不停。
@@ -80,7 +82,8 @@ description: bifu-confsource（统一配置平台的 Kratos config.Source 客户
 **同一 Txn 读两个 key**：config 与 meta 必须来自同一 revision；`publish_id` 拿不到只影响快照 meta，不影响加载。`${VAR}` 缺失拒掉整版（严格模式默认）；Delete 事件忽略并告警；`ModRevision` 不大于 Committed Revision 的事件跳过。
 
 **并发安全与资源生命周期**
-- 一个 `Source` 只有一条事件 goroutine，由 `Watch()` 启动且只允许一次（`ErrWatchStarted`）；所有 goroutine 与 etcd 调用都派生自 `Source.ctx`，`Close()` 取消它并关闭 client，之后不得再有后台活动或往 channel 写。
+- **首次 Load**：在调用方 goroutine 执行，只调用一次且在 `Watch()` 之前（Kratos 的顺序）；它的 commit 与快照写入和事件循环不并发；用 `Source.ctx` 加超时发 etcd 请求，`Close()` 后不得再 Load。
+- **Watch 阶段**：一个 `Source` 只有一条事件 goroutine，由 `Watch()` 启动且只允许一次（`ErrWatchStarted`）；启动后所有 commit 只发生在这条 goroutine 里；所有 goroutine 与 etcd 调用都派生自 `Source.ctx`，`Close()` 取消它并关闭 client，之后不得再有后台活动或往 channel 写。
 - 事件按 revision 顺序串行处理：Validator、OnCommit、快照写入都只在事件 goroutine 里调用，**不并发调用回调**；不加缓冲 channel、不丢事件、不乱序。
 - 慢消费者：交付给 Kratos 是阻塞的，前一版被取走之前不处理下一版；这是设计，不要为了「不阻塞」改成丢弃或覆盖。阻塞必须能被 ctx 取消打断，`Close()` 不能被慢消费者卡住。
 - 跨 goroutine 读写的状态（Committed Revision、degraded）只走原子操作；新增共享状态同样用原子或锁，并在 race 下验证。
@@ -95,14 +98,16 @@ description: bifu-confsource（统一配置平台的 Kratos config.Source 客户
 - **Option**：新能力用新增 `With*` 加默认值；已有 Option 的语义与默认值不变；默认值要改必须拍板，并写明对所有接入服务的影响。
 - **默认行为**：Load / Watch / 降级 / 退避 / 快照位置的默认表现不变。
 - **etcd 协议**：key 规则、meta 字段只能新增可选字段；读 meta 时未知字段忽略、缺失字段按空处理。
-- **快照格式**：新版本必须能读旧版本写的快照；读不懂按「meta 不配对」处理（内容可用、revision 为 0），不能崩、不能拒绝启动。
+- **快照格式**：新版本必须能读旧版本写的快照，且 hash 校验规则不变；格式变更先改系分再改代码，并保证旧文件按上文「快照完整性校验」的规则处理，不能崩、不能绕过校验。
 - **错误类型**：`errors.go` 的哨兵值不改名不删除；对外返回的错误用 `%w` 包装，调用方的 `errors.Is` 必须继续成立。
 - **指标**：已有指标名、类型、标签集不变；只能新增指标。
 - **环境变量**：名字由 bifufx-api 的加载器读取，是共同契约；新增变量必须有默认值，不设也能启动。
 
 ## 日志安全
 
-日志前缀保持 `module=confsource`，只记 service、revision、publish_id、错误类型与错误文本。**禁止输出**：配置原文或片段、展开后的变量值、`${VAR}` 对应的实际值、etcd 用户名密码、带凭据的 endpoint、TLS 材料。Validator / OnCommit 返回的错误只能带变量名或字段路径，不能带值；本仓对回调错误一律 `%v` 转发，不自己拼内容；Debug 级别也不例外。
+日志前缀保持 `module=confsource`，只记 service、revision、publish_id、错误分类与经过收敛的错误文本。**禁止输出**：配置原文或片段、展开后的变量值、`${VAR}` 对应的实际值、etcd 用户名密码、带凭据的 endpoint、TLS 材料。
+
+原始错误不能直接转发：Validator / OnCommit 返回的错误可能来自 yaml 解析或 protojson 解码，错误文本里会带上出错位置的原始值；etcd client 的错误可能带 endpoint。记日志前先收敛：本仓自己的哨兵错误与 `envexpand.MissingError`（只含变量名）可以原样记；其他回调错误只记错误类型、revision 与一句固定描述，完整文本不进日志；需要排查时靠 revision 到平台查该版本，不靠日志里的内容。Debug 级别也不例外。
 
 ## 命令（本机核实过）
 
@@ -128,11 +133,13 @@ go test -race -run 'TestXxx' -v ./...
 
 ## 接入 bifufx-api：本地验证与正式升级分开
 
-**本地验证**（不需要 commit / push，不访问远程）：在 bifufx-api 用 `go.work`（`go work use <bifufx-api> <本仓本地路径>`）或在它的 `go.mod` 临时加 `replace github.com/decodeex/bifu-confsource => <本仓本地路径>`，然后 `go build ./... && go test ./utils/configuration/...`。`go.work`、`go.work.sum` 与临时 `replace` **只用于本机验证，不得进入提交**；验证完删掉并确认 `git status` 干净。
+**本地验证**（不需要 commit / push，不访问远程）：先记下 bifufx-api 的 `git status`，再用 `go.work`（`go work use <bifufx-api> <本仓本地路径>`）或在它的 `go.mod` 临时加 `replace github.com/decodeex/bifu-confsource => <本仓本地路径>`，然后 `go build ./... && go test ./utils/configuration/...`。`go.work`、`go.work.sum` 与临时 `replace` **只用于本机验证，不得进入提交**；验证完只删掉自己加的这几处，再对照之前的 `git status`，用户原有的未提交改动一个都不能动，不用 `git checkout --`、`git stash`、`git clean` 之类的整体回退。
+
+**Go 命令不访问远程**：两条路径都在 `GOPROXY=off GOPRIVATE=github.com/decodeex/*` 下跑，依赖只许来自本机模块缓存与本地路径；命令因缺模块失败就停下来告诉用户，不自行改成联网下载，也不自行 `go mod download`。
 
 **正式升级**（伪版本钉死某个 commit）：
 1. 本仓改完、测试绿，**由用户 commit 并 push**（AI 不做）。
-2. 解析伪版本不经网络：在 scratchpad 放一份 gitconfig，用 `[url "<本仓本地路径>"] insteadOf = https://github.com/decodeex/bifu-confsource` 把模块地址指到本地克隆，然后 `GIT_CONFIG_GLOBAL=<那份文件> GOFLAGS=-mod=mod go get github.com/decodeex/bifu-confsource@<commit>` 得到 `v0.0.0-<时间戳>-<12位hash>` 与 go.sum。
+2. 解析伪版本不经网络：在 scratchpad 放一份 gitconfig，用 `[url "<本仓本地路径>"] insteadOf = https://github.com/decodeex/bifu-confsource` 把模块地址指到本地克隆，然后 `GIT_CONFIG_GLOBAL=<那份文件> GOPROXY=off GOPRIVATE='github.com/decodeex/*' GOFLAGS=-mod=mod go get github.com/decodeex/bifu-confsource@<commit>` 得到 `v0.0.0-<时间戳>-<12位hash>` 与 go.sum。
 3. 改 bifufx-api `go.mod` 的 require 行（放在直接依赖块，不带 `// indirect`），**不要 `go mod tidy`**（它会动无关依赖），然后 `go build ./... && go test ./utils/configuration/...`。
 4. 告诉用户：bifufx-api 这次只改 `go.mod` / `go.sum`；CI 拉本仓依赖 `.github/gitconfig` 的 SSH 改写与 CI 身份对本仓的读权限。
 
