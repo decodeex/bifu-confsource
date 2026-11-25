@@ -410,7 +410,7 @@ func replaceMerge(dst, src any) error {
 ### 6.2 etcd 账号
 
 - 服务用**只读**账号，对 `/config/` 和 `/meta/` 两个前缀都要有 READ 权限。SDK 在一个事务里同时读配置和 meta，少了 `/meta/` 的权限，整个读取都会被拒。
-- 目前只支持账号密码认证，不支持 TLS。
+- etcd 只开了账号密码认证，各环境都没有启用 TLS，所以参考代码也只接了账号密码。
 
 ### 6.3 快照目录
 
