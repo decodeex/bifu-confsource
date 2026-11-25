@@ -41,6 +41,14 @@ SDK 版本：`main` 分支 `0f285b7`，go.mod 里写作 `v0.0.0-20261029061230-0
 
 每个环境的平台都要各做一遍。
 
+| 环境 | 平台地址 |
+|---|---|
+| dev | https://config-center.dev.decodebackoffice.com/ |
+| staging | https://config-center-staging.decodebackoffice.com/ |
+| 生产 | https://config-center.decodebackoffice.com/ |
+
+平台只能经 Teleport 访问，用 Teleport 身份登录，没有单独的密码。平台不会自动建号：第一次使用前，要找平台管理员按你的 Teleport 用户名建好账号，并授予对应服务的权限，否则登录时会提示账号未开通。
+
 1. **新增服务**：在「服务」页新增，需要平台管理员操作。
    - 服务名只能用小写字母、数字和 `-`，以字母或数字开头，长度 2–64，**建好后不能改**。
    - 服务名就是部署里的 `CONFIG_SERVICE`，也决定 etcd key `/config/{服务名}.yaml`。服务原来在 bifufx-configmaps 里有配置文件的，服务名要和文件名一致。
