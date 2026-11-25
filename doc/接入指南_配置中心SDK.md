@@ -2,7 +2,7 @@
 
 bifu-confsource 是统一配置平台的 Go 客户端 SDK。服务接入后，配置改为从配置平台读取：平台上发布一版，运行中的进程不用重启，内存里的配置就会换成新版；etcd 连不上时，用本机上次成功加载的快照启动。
 
-本文适用于自己读取 yaml 配置并解析成结构体的 Go 服务，Kratos 和非 Kratos 都可以。bifufx-api 仓库里的服务走仓库自带的共享加载器，不需要按本文接入。
+本文适用于自己读取 yaml 配置并解析成结构体的 Go 服务，Kratos 和非 Kratos 都可以。bifufx-api 仓库里的服务由 bifufx-api 统一接入，不需要看本文。
 
 SDK 版本：`main` 分支 `0f285b7`，go.mod 里写作 `v0.0.0-20261029061230-0f285b75bbff`。
 
@@ -74,6 +74,8 @@ SDK 版本：`main` 分支 `0f285b7`，go.mod 里写作 `v0.0.0-20261029061230-0
 - 值**整个就是**一个 `${VAR}`：放行，这是密钥唯一合法的写法。
 - 其他字符串，包括明文、`{{ VAR }}`、拼接写法（如 `pre_${X}`）：**拒绝保存**。
 
+字段名不像密钥的字段不受上面的限制，可以拼接，比如 MySQL DSN：`source: "${DB_USER}:${DB_PASSWORD}@tcp({{ DB_RW_HOST }}:3306)/app"`。
+
 字段名不像密钥、但值看起来像密钥的（长串高熵、`AKIA…`、`-----BEGIN` 等），不会拒绝保存，会在审批时标出来提醒审批人。
 
 新增一个密钥变量时，按平台报错提示的流程找 SRE 把真值放进密钥管理，并注入 Pod 环境变量。
@@ -119,7 +121,7 @@ go mod tidy
 - **写法 A（默认）**：加载器直接调用 SDK，不经过 Kratos 的 `config.Config`。非 Kratos 服务用它，Kratos 服务如果只通过 `GetConfig()` 读配置也用它。
 - **写法 B**：业务代码里有直接用 Kratos `config.Config` 的地方（`c.Value(...)`、`c.Watch(...)`）才用它，让那部分也跟着更新。
 
-两种写法对外都是同一个 `GetConfig()`。下面的代码已经在内嵌 etcd 上验证过：首次加载、连续热更新、缺变量的版本被拒、删字段变零值、快照降级启动都没问题。
+两种写法对外都是同一个 `GetConfig()`。下面的代码（含 5.3 的入口）已经在内嵌 etcd 上编译运行过，覆盖首次加载、连续热更新、缺变量的版本被拒、删字段变零值、快照降级启动。
 
 ### 5.3 入口：按环境变量切换来源
 
@@ -137,9 +139,12 @@ func NewConfiguration[T any](flagConf string) (Configuration[T], error) {
 	if os.Getenv(envConfigSource) == sourceEtcd {
 		return newEtcdConfiguration[T]()
 	}
-	return newFileConfiguration[T](flagConf) // 服务原有的文件读取逻辑
+	return newFileConfiguration[T](flagConf)
 }
 ```
+
+- `newFileConfiguration` 换成服务原有的文件读取函数。本地开发不设 `CONFIG_SOURCE`，照旧读本地文件。
+- 拿到的 `Configuration` 在进程退出前调用 `Close()`（比如 `defer cf.Close()`），停止监听并关闭 etcd 连接。
 
 ### 5.4 写法 A：直接用 SDK
 
@@ -180,7 +185,8 @@ type etcdConfiguration[T any] struct {
 	lookup envexpand.Lookup
 }
 
-func newEtcdConfiguration[T any]() (*etcdConfiguration[T], error) {
+// 返回接口类型：出错时调用方拿到的是真正的 nil，而不是装着 nil 指针的接口
+func newEtcdConfiguration[T any]() (Configuration[T], error) {
 	service := os.Getenv(envService)
 	if service == "" {
 		return nil, fmt.Errorf("configuration: %s is required when %s=%s", envService, envConfigSource, sourceEtcd)
@@ -233,7 +239,7 @@ func (m *etcdConfiguration[T]) validate(_ int64, raw []byte) error {
 	return err
 }
 
-// onCommit 可能失败的步骤都放在 Store 之前，Store 必须是最后一步
+// onCommit 可能失败的步骤都放在 Store 之前，Store 之后不能再返回错误
 func (m *etcdConfiguration[T]) onCommit(_ int64, raw []byte) error {
 	cfg, err := m.decode(raw)
 	if err != nil {
@@ -300,7 +306,7 @@ type etcdConfiguration[T any] struct {
 }
 ```
 
-`newEtcdConfiguration` 里，从 `source.Load()` 到末尾 `m.source = source` 的那一段整体换成：
+`newEtcdConfiguration` 里，从 `if _, err := source.Load(); err != nil {` 开始到函数结尾，整段换成：
 
 ```go
 	// Kratos 的 Load 会调用 SDK 的 Load 和 Watch，并在后台一直取新版本，不用自己起协程
@@ -366,12 +372,12 @@ func replaceMerge(dst, src any) error {
 - 一段逻辑里需要几个字段前后一致的，开头取一次 `cfg := cf.GetConfig()`，后面都用这个 `cfg`。
 - **不要改 `GetConfig()` 返回的结构体**。所有协程共享这一份，只读。
 - **启动时用来建连接的配置改了，仍然要重启**，比如数据库 DSN、Redis 地址、Kafka broker、监听端口、gRPC 客户端地址：这些对象在启动时就建好了，SDK 不会帮你重建。
-- 想在配置变化后做点什么（比如重建某个客户端），可以在 `onCommit` 的 `Store` 之后发一个不会失败、不阻塞的通知（如 `select { case ch <- cfg: default: }`），具体的活放到别的协程里做。
+- 想在配置变化后做点什么（比如重建某个客户端），可以在 `onCommit` 的 `Store` 之后发一个不会失败、不阻塞的通知（如 `select { case ch <- cfg: default: }`），具体的活放到别的协程里做。启动加载时也会调用一次 `onCommit`。
 - 想拦截业务上不合法的值（比如超时为 0），在 `decode` 末尾加校验，返回错误就会拒掉这一版。
 
 ### 5.7 必须遵守的规则
 
-1. **`Store` 是 `onCommit` 的最后一步**。SDK 撤销不了已经发生的 `Store`，可能失败的步骤都要放在它前面，否则会出现内存已经换了、SDK 却认为这一版失败的情况。
+1. **`onCommit` 里可能失败的步骤都放在 `Store` 之前**。SDK 撤销不了已经发生的 `Store`，Store 之后再返回错误，就会出现内存已经换了、SDK 却认为这一版失败的情况。Store 之后只允许做不会失败、不阻塞的事，比如 5.6 里的非阻塞通知。
 2. **写法 A 必须一直有协程在取 `Next()`**。没人取的话，第一次发布还能进内存，从第二次起全部收不到。
 3. **`validate` 和 `onCommit` 用同一个 `decode`**。校验通过、加载却失败的话，这一版会被拒，告警也不好查。
 4. **`NewConfiguration` 返回错误就退出进程**，不要吞掉错误或者用默认值兜底启动。宁可启动失败让 K8s 重试，也不能带着空配置跑。
@@ -417,6 +423,8 @@ func replaceMerge(dst, src any) error {
 
 建议告警：`confsource_degraded == 1` 持续 5 分钟；同一服务各副本的 `confsource_loaded_revision` 长时间不一致。
 
+当前版本没有「版本被拒」的指标，坏版本被拒只体现在日志里，所以还要配日志告警：级别为 ERROR、带 `module=confsource` 的日志（关键字 `rejected`、`apply failed`、`config key deleted`）。每次发布后，也可以对比各副本的 `confsource_loaded_revision` 和平台「当前配置」的 etcd revision，不一致说明有副本没拿到这一版。
+
 ### 6.5 日志
 
 SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=confsource service=…`。想接进服务自己的日志体系，就实现 Kratos 的 `log.Logger` 接口（只有一个 `Log(level, keyvals...)` 方法），通过 `confsource.WithLogger(l)` 传进去。
@@ -432,9 +440,11 @@ SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=con
 3. 看启动：日志里没有 `confsource` 报错，进程正常起来。
 4. 看 `/metrics`：`confsource_loaded_revision` 等于平台「当前配置」的 etcd revision，`confsource_degraded` 为 0。
 5. 在平台上改一个无关紧要的值并发布。不重启 Pod，`confsource_loaded_revision` 跟着变成新的 revision，业务按 5.6 的方式读到新值。
-6. （可选，只在 dev 做）发布一版引用了不存在变量的配置。日志出现 `revision N rejected`，`confsource_loaded_revision` 不变。验证完马上在平台回滚。
 
-**回退**：去掉 `CONFIG_SOURCE` 后滚动重启，服务就回到原来的文件配置。前提是原来的文件配置还在、挂载没删。
+**回退**：
+
+- 原来有文件配置的服务：去掉 `CONFIG_SOURCE` 后滚动重启，回到文件配置，前提是原来的文件配置挂载还在。切到平台之后改过的配置只存在平台上，回退前要先把平台「当前配置」同步回文件配置，否则回退等于配置倒回切换前。
+- 一开始就只在平台上的新服务没有文件配置可退，配置出问题就在平台「历史版本」里回滚。
 
 ---
 
@@ -453,7 +463,7 @@ SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=con
 | 运行中 etcd 断开 | 内存配置不变，服务照常运行，后台自动重连 |
 | etcd 里的 key 被删 | 忽略，打错误日志，保持当前配置 |
 
-**坏版本被拒，只是保护正在跑的 Pod，不等于回滚了**。etcd 里存的仍是那版坏配置，新起的 Pod（扩容、重启、发版）会因为它启动失败。看到 `rejected` 日志就要马上在平台上修正或回滚。
+**坏版本被拒，只是保护正在跑的 Pod，不等于回滚了**。etcd 里存的仍是那版坏配置，新起的 Pod（扩容、重启、发版）会因为它启动失败。看到 `rejected` 日志就要马上在平台上修正或回滚。当前版本只有日志能反映版本被拒，日志告警的配法见 [6.4](#64-指标)。
 
 所以**新增 `${VAR}` 的顺序是固定的**：先让 SRE 把变量注入 Pod 并滚动重启，再在平台上发布引用它的配置。顺序反过来，正在跑的 Pod 会全部拒掉新版，新起的 Pod 则起不来。
 
@@ -473,6 +483,7 @@ SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=con
 | `confsource: revision N rejected: json: cannot unmarshal …` 或 `proto: …` | 值的类型和结构体对不上 | 改配置里的值，或者改结构体 |
 | `confsource: snapshot rejected: …` | etcd 不可用，本机快照里那版也通不过校验，比如变量后来被删了 | 恢复 etcd 连接，或补齐变量 |
 | 日志 `etcd unavailable, starting from snapshot` | 用快照降级启动了 | 查 etcd 连通性和账号权限。读权限不够时，有快照也会走这条 |
+| 日志 `resync failed, retry in …` 持续出现 | 降级运行中，重连 etcd 后重新拉取一直失败，会按退避一直重试，`confsource_degraded` 保持 1 | 按日志里的原因查连通性和账号权限。读权限不够、本机又有快照时，服务会一直停在这个状态 |
 | 日志 `write snapshot failed` | 快照目录写不进去 | 查挂载和目录权限，不影响运行 |
 | 日志 `watch interrupted, reconnect in …` / `watch revision compacted, reloading full config` | 监听断开后自动重连 / 重新全量拉取 | 偶发属于正常；持续出现就查 etcd |
 
@@ -481,8 +492,8 @@ SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=con
 ## 10 当前版本的已知限制
 
 1. **开了账号密码时，启动阶段的快照兜底不生效**。etcd 客户端在创建连接时会同步认证，启动那一刻 etcd 连不上就直接失败（`confsource: etcd client: context deadline exceeded`），不会走到读快照那一步。已在内嵌 etcd 上实测确认。不开账号密码时没有这个问题。已经在运行的服务不受影响，etcd 断开后照常用内存配置。
-2. **没有连接心跳**。etcd 连接静默断开（连接看起来还在，但数据不通）时，可能很久收不到新发布，表现为 `confsource_loaded_revision` 一直不跟平台走。遇到时重启 Pod。
+2. **没有连接心跳**。监听连接在空闲时静默断开（连接看起来还在，但数据已经不通），SDK 发现不了，之后的发布可能一直收不到，直到 Pod 重启。也没有「最近一次同步时间」指标，只能在下一次发布后发现 `confsource_loaded_revision` 没跟上平台。遇到时重启 Pod。
 3. **快照校验不严格**。快照的 `.meta` 缺失或和内容对不上时，仍会用快照内容启动，revision 记为 0，连上 etcd 后会重新拉取全量。
 4. **指标只有两个**，看不到内容哈希和最近一次同步的时间。
 
-第 2–4 条在 SDK 后续版本里已经修复，main 更新后再统一升级，升级只改 go.mod 一行。
+第 2–4 条在 SDK 后续版本里已经修复，main 更新后再统一升级，升级只需改 go.mod 和 go.sum。
