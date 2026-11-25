@@ -1,6 +1,6 @@
 # bifu-confsource 接入指南
 
-bifu-confsource 是统一配置平台的 Go 客户端 SDK。服务接入后，配置改为从配置平台读取：平台上发布一版，运行中的进程不用重启，内存里的配置就会换成新版；etcd 连不上时，用本机上次成功加载的快照启动。
+bifu-confsource 是统一配置平台的 Go 客户端 SDK。服务接入后，配置改为从配置平台读取：平台上发布一版，运行中的进程不用重启，内存里的配置就会换成新版；运行中 etcd 断开不影响服务，继续用内存里的配置。启动时 etcd 必须可用，当前版本的本机快照还起不到启动兜底作用（见[第 10 节](#10-当前版本的已知限制)）。
 
 本文适用于自己读取 yaml 配置并解析成结构体的 Go 服务，Kratos 和非 Kratos 都可以。bifufx-api 仓库里的服务由 bifufx-api 统一接入，不需要看本文。
 
@@ -121,7 +121,7 @@ go mod tidy
 - **写法 A（默认）**：加载器直接调用 SDK，不经过 Kratos 的 `config.Config`。非 Kratos 服务用它，Kratos 服务如果只通过 `GetConfig()` 读配置也用它。
 - **写法 B**：业务代码里有直接用 Kratos `config.Config` 的地方（`c.Value(...)`、`c.Watch(...)`）才用它，让那部分也跟着更新。
 
-两种写法对外都是同一个 `GetConfig()`。下面的代码（含 5.3 的入口）已经在内嵌 etcd 上编译运行过，覆盖首次加载、连续热更新、缺变量的版本被拒、删字段变零值、快照降级启动。
+两种写法对外都是同一个 `GetConfig()`。下面的代码（含 5.3 的入口）已经在内嵌 etcd 上编译运行过，覆盖首次加载、连续热更新、缺变量的版本被拒、删字段变零值。
 
 ### 5.3 入口：按环境变量切换来源
 
@@ -394,7 +394,7 @@ func replaceMerge(dst, src any) error {
 | `CONFIG_SOURCE` | 是 | 填 `etcd` 打开配置平台模式。不设或填其他值就走原来的文件配置，回退时去掉它即可 |
 | `CONFIG_ETCD_ENDPOINTS` | 是 | 本环境 etcd 地址，多个用逗号分隔，如 `http://etcd-0:2379,http://etcd-1:2379` |
 | `CONFIG_SERVICE` | 是 | 服务名，和平台上建的服务名一致 |
-| `CONFIG_ETCD_USERNAME` / `CONFIG_ETCD_PASSWORD` | 看 etcd 是否开认证 | 只读账号，密码从 Secret 注入。开认证后的限制见[第 10 节](#10-当前版本的已知限制)第 1 条 |
+| `CONFIG_ETCD_USERNAME` / `CONFIG_ETCD_PASSWORD` | 是 | etcd 只读账号，密码从 Secret 注入 |
 | `CONFIG_SNAPSHOT_DIR` | 否 | 本机快照目录，默认 `/var/lib/confsource` |
 | `CONFIG_STRICT_ENV` | 否 | 默认严格，缺变量就拒掉这一版。填 `false` 时缺的变量当空串，只建议迁移过渡期临时用 |
 | 配置里 `${VAR}` 引用的全部变量 | 是 | 密钥从 Secret 注入。可选的变量也要声明，可以为空 |
@@ -402,14 +402,14 @@ func replaceMerge(dst, src any) error {
 ### 6.2 etcd 账号
 
 - 服务用**只读**账号，对 `/config/` 和 `/meta/` 两个前缀都要有 READ 权限。SDK 在一个事务里同时读配置和 meta，少了 `/meta/` 的权限，整个读取都会被拒。
-- 参考代码只接了账号密码。本环境 etcd 要求 TLS 的话，加 `confsource.WithTLS(tlsConfig)`，证书找 SRE 签发。
+- 目前只支持账号密码认证，不支持 TLS。
 
 ### 6.3 快照目录
 
 - 建议挂 hostPath `/var/lib/confsource`（`DirectoryOrCreate`），读写，容器用户要有写权限。
 - 文件是 `{服务名}.yaml`、`{服务名}.yaml.meta` 和 `{服务名}.lock`。同一节点上同一服务的多个副本共享这几个文件，靠文件锁互斥，这是设计内的用法。
 - 快照里只有 `${VAR}` 引用，没有密钥真值。
-- 不挂卷也能运行，只是 Pod 重建后本机没有快照，etcd 不可用时就起不来。目录写不进去时只会打错误日志，不影响服务运行。
+- 当前版本启动阶段用不上快照（见[第 10 节](#10-当前版本的已知限制)第 1 条），要等 SDK 修复后才真正起兜底作用，建议现在就挂上。不挂卷也能运行，目录写不进去时只会打错误日志，不影响服务运行。
 
 ### 6.4 指标
 
@@ -453,9 +453,9 @@ SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=con
 | 情况 | 结果 |
 |---|---|
 | 启动时 etcd 正常 | 从 etcd 加载，写本机快照，`degraded=0` |
-| 启动时 etcd 连不上、本机有快照、**没开账号密码** | 等约 3 秒（单次请求超时）后用快照启动，`degraded=1`；后台按 1 秒到 30 秒退避重连，连上后对齐到 etcd 最新版 |
-| 启动时 etcd 连不上、**开了账号密码** | 启动失败，不会用快照，见第 10 节第 1 条 |
-| 启动时 etcd 连不上、本机没快照 | 启动失败 |
+| 启动时 etcd 连不上 | 约 3 秒后启动失败，本机有快照也用不上，见第 10 节第 1 条 |
+| 启动时连上了 etcd 但读取失败（比如账号缺读权限），本机有快照 | 用快照启动，`degraded=1`；后台按 1 秒到 30 秒退避重试，读到后对齐到 etcd 最新版 |
+| 启动时连上了 etcd 但读取失败，本机没快照 | 启动失败 |
 | 平台上没发布过这个服务 | 启动失败（`key ... not found`），这种情况也不会用快照顶替 |
 | 启动时最新一版缺变量或解析不了 | 启动失败，报错里写明原因 |
 | 运行中发布了合法的新版 | 通常一秒内换进内存，写快照，revision 前进 |
@@ -475,7 +475,7 @@ SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=con
 |---|---|---|
 | `configuration: CONFIG_SERVICE is required when CONFIG_SOURCE=etcd` | 没设服务名 | 补 `CONFIG_SERVICE` |
 | `confsource: endpoints required` | 没设 etcd 地址 | 补 `CONFIG_ETCD_ENDPOINTS` |
-| `confsource: etcd client: context deadline exceeded` | 开了账号密码，创建连接时 etcd 连不上 | 检查地址、网络策略；etcd 恢复后重启 |
+| `confsource: etcd client: context deadline exceeded` | 创建连接时连不上 etcd：地址不对、网络不通或 etcd 不可用 | 检查地址和网络策略；etcd 恢复后，K8s 重启 Pod 时就能起来 |
 | `confsource: etcd client: etcdserver: authentication failed, invalid user ID or password` | 账号或密码不对 | 核对账号密码 |
 | `confsource: no config available from etcd or snapshot: key /config/xxx.yaml not found` | 这个环境的平台上没发布过，或者服务名写错、连错了环境的 etcd | 去平台发布第一版，核对 `CONFIG_SERVICE` 和地址 |
 | `confsource: no config available from etcd or snapshot (etcd: …; snapshot: confsource: snapshot missing)` | etcd 读不到，本机也没有快照。括号里 `etcd:` 后面是真正的原因，可能是不通，也可能是 `permission denied` | 按括号里的原因处理；`permission denied` 就是只读账号缺 `/config/` 或 `/meta/` 的读权限 |
@@ -491,7 +491,7 @@ SDK 默认用 Kratos 的全局 logger 打到标准输出，日志带 `module=con
 
 ## 10 当前版本的已知限制
 
-1. **开了账号密码时，启动阶段的快照兜底不生效**。etcd 客户端在创建连接时会同步认证，启动那一刻 etcd 连不上就直接失败（`confsource: etcd client: context deadline exceeded`），不会走到读快照那一步。已在内嵌 etcd 上实测确认。不开账号密码时没有这个问题。已经在运行的服务不受影响，etcd 断开后照常用内存配置。
+1. **启动阶段的快照兜底不生效**。用账号密码连 etcd 时，etcd 客户端在创建连接时会同步认证，启动那一刻 etcd 连不上就直接失败（`confsource: etcd client: context deadline exceeded`），走不到读快照那一步，已在内嵌 etcd 上实测确认。也就是说 etcd 不可用期间，新起的 Pod（扩容、重启、发版）都起不来。已经在运行的服务不受影响，etcd 断开后照常用内存配置。
 2. **没有连接心跳**。监听连接在空闲时静默断开（连接看起来还在，但数据已经不通），SDK 发现不了，之后的发布可能一直收不到，直到 Pod 重启。也没有「最近一次同步时间」指标，只能在下一次发布后发现 `confsource_loaded_revision` 没跟上平台。遇到时重启 Pod。
 3. **快照校验不严格**。快照的 `.meta` 缺失或和内容对不上时，仍会用快照内容启动，revision 记为 0，连上 etcd 后会重新拉取全量。
 4. **指标只有两个**，看不到内容哈希和最近一次同步的时间。
